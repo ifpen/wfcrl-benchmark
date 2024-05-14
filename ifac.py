@@ -39,6 +39,8 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
+    save_model: bool = True
+    """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
     env_id: str = "Turb3_Row1_Floris"
@@ -248,7 +250,7 @@ if __name__ == "__main__":
 
     for step in range(1, args.total_timesteps):
 
-        global_step += 1
+        global_step += args.num_envs
         # obs = next_obs
 
         # ALGO LOGIC: action logic
@@ -258,14 +260,14 @@ if __name__ == "__main__":
                 last_obs, reward, terminations, truncations, infos = env.last()
                 last_obs = torch.Tensor(partial_obs_extractor(last_obs)).to(device)
                 action, logprob, _, value = agent.get_action_and_value(last_obs)
-                next_done = np.logical_or(terminations, truncations)
-                next_done = torch.Tensor([next_done.astype(int)]).to(device)
+                last_done = np.logical_or(terminations, truncations)
+                last_done = torch.Tensor([last_done.astype(int)]).to(device)
 
                 # store values
                 values[step, :, idagent] = value.flatten()
                 logprobs[step, :, idagent] = logprob
                 obs[step, :, idagent] = last_obs
-                dones[step, :, idagent] = next_done
+                dones[step-1, :, idagent] = last_done
                 rewards[step-1, :, idagent] = torch.tensor(reward).to(device).view(-1)
                 if "power" in infos:
                     powers.append(infos["power"])
@@ -319,12 +321,18 @@ if __name__ == "__main__":
                 optimizers[idagent].step()
 
                 # TRY NOT TO MODIFY: record rewards for plotting purposes
-                writer.add_scalar("charts/learning_rate", optimizers[idagent].param_groups[0]["lr"], global_step)
-                writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-                writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+                writer.add_scalar(f"charts/agent_{idagent}/learning_rate", optimizers[idagent].param_groups[0]["lr"], global_step)
+                writer.add_scalar(f"losses/agent_{idagent}/value_loss", v_loss.item(), global_step)
+                writer.add_scalar(f"losses/agent_{idagent}/policy_loss", pg_loss.item(), global_step)
                 # print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+            writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    if args.save_model:
+        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        for idagent, agent in enumerate(agents):
+            torch.save(agent.state_dict(), model_path+f"_{idagent}")
+        print(f"model saved to {model_path}")
 
     env.close()
     writer.close()

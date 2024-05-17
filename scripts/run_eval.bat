@@ -1,0 +1,5 @@
+mpiexec -n 1 python algos/eval.py --seed 0 --env_id Dec_Turb3_Row1_Fastfarm --total_timesteps 1000 --num_steps 1000 --pretrained_models runs/Dec_Turb3_Row1_Floris__baseline_mappo__0__1717297654
+mpiexec -n 1 python algos/eval.py --seed 1 --env_id Dec_Turb3_Row1_Fastfarm --total_timesteps 1000 --num_steps 1000 --pretrained_models runs/Dec_Turb3_Row1_Floris__baseline_mappo__1__1717228477
+mpiexec -n 1 python algos/eval.py --seed 2 --env_id Dec_Turb3_Row1_Fastfarm --total_timesteps 1000 --num_steps 1000 --pretrained_models runs/Dec_Turb3_Row1_Floris__baseline_mappo__2__1717229629
+mpiexec -n 1 python algos/eval.py --seed 3 --env_id Dec_Turb3_Row1_Fastfarm --total_timesteps 1000 --num_steps 1000 --pretrained_models runs/Dec_Turb3_Row1_Floris__baseline_mappo__3__1717298908
+mpiexec -n 1 python algos/eval.py --seed 4 --env_id Dec_Turb3_Row1_Fastfarm --total_timesteps 1000 --num_steps 1000 --pretrained_models runs/Dec_Turb3_Row1_Floris__baseline_mappo__4__1717300047

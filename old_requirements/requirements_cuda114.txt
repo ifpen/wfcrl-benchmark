@@ -1,0 +1,13 @@
+tensorboard-data-server==0.6.1
+tensorboard-plugin-wit==1.8.1
+tensorboard==2.11.2
+pytorch==2.0.1
+pytorch-cuda==11.4
+tyro==0.8.3
+wfcrl @ git+https://github.com/cibeah/WFCRL.git
+stable-baselines3
+wandb
+seaborn
+
+# conda install pytorch=2.0.1 pytorch-cuda=11.4 -c pytorch -c nvidia
+pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cu114

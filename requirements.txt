@@ -1,7 +1,7 @@
 tensorboard-data-server==0.6.1
 tensorboard-plugin-wit==1.8.1
 tensorboard==2.11.2
-torch
+torch==2.0.1
 tyro==0.8.3
 wfcrl @ git+https://github.com/ifpen/wfcrl-env.git
 stable-baselines3

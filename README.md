@@ -11,7 +11,9 @@ Algorithms:
 |----------------------------------|--------------------|--------------------------------------------------------------------------------------|
 | IPPO           | `algos/baseline_ippo.py`   | See [Yu et. al](https://arxiv.org/abs/2103.01955)            |
 | MAPPO          | `algos/baseline_mappo.py`  |  See [Yu et. al](https://arxiv.org/abs/2103.01955)     |
+| QMIX           | `algos/baseline_qmix.py`     | See [Rashid et. al](https://arxiv.org/abs/1803.11485)  |
 | IFAC           | `algos/ifac.py`     | Simple online actor critic with Fourier Basis     |
+| IQN           | `algos/idqn.py`     | Simple independent DQN    |
 
 Scripts with the `windrose` suffix train under *Wind Scenario II*. Other implement *Wind Snecario I*.
 

@@ -1,9 +1,13 @@
 import decimal
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from pathlib import Path
 import seaborn as sns
+from torch.utils.tensorboard import SummaryWriter
+import yaml
 
 
 sns.set_theme(style="darkgrid")
@@ -120,3 +124,99 @@ def eval_wind_rose(env, policies, wind_rose, get_action=None):
             episode_rewards.append(r)
             score += freq[i, j] * r
     return score, np.array(episode_rewards)
+
+
+class LocalSummaryWriter(SummaryWriter):
+    def __init__(self, log_dir, max_queue, **kwargs):
+        super().__init__(log_dir, max_queue, **kwargs)
+        log_dir = Path(log_dir)
+        assert log_dir.is_dir()
+        self._log_dir = log_dir
+        self._csv_path = log_dir / "logs.csv"
+        self._max_queue = max_queue
+        self.csv_files = {}
+        self._columns_counter = {}
+        self._last_step = 0
+        self._must_save = False
+
+    @property
+    def metrics(self):
+        all_metrics = []
+        for columns in self.csv_files.values():
+            all_metrics.extend(list(columns.key()))
+        return all_metrics
+
+    def add_config(self, args):
+        super().add_text(
+            "hyperparameters",
+            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in args.items()])),
+        )
+        with (self._log_dir / "config.yaml").open("w") as f:
+            yaml.dump(args, f)
+
+    def add_scalar(self, tag, scalar_value, global_step, **kwargs):
+        """"
+        logs must be received in chronological order as defined by global_step !
+        """
+        super().add_scalar(tag, scalar_value, global_step, **kwargs)
+        assert isinstance(global_step, int)
+        if self._must_save and (global_step > self._last_step):
+            self.save()
+            self._clear()
+            self._must_save = False
+        tag_splits = tag.split("/")
+        filed_in, name = tag_splits[0], "_".join(tag_splits[1:])
+        if filed_in not in self.csv_files:
+            self.csv_files[filed_in] = {}
+        if name not in self.csv_files[filed_in]:
+            self.csv_files[filed_in][name] = {}
+        self.csv_files[filed_in][name][global_step] = scalar_value
+        
+        # it too much in queue, wait for next step and save
+        if len(self.csv_files[filed_in][name]) > self._max_queue:
+            self._must_save = True
+        self._last_step = global_step
+
+    def save(self):
+        for file in self.csv_files:
+            file_df = pd.DataFrame(self.csv_files[file]).reset_index()
+            out_path = self._log_dir / f"{file}.csv"
+            #TODO: fi length so that no more columns are added !!!
+            if not out_path.exists():
+                with out_path.open("w") as f:
+                    f.write(",".join(file_df.columns)+"\n")
+                self._columns_counter[file] = file_df.columns.size
+            if file_df.columns.size == self._columns_counter[file]:
+                file_df.to_csv(out_path, mode="a", index=False, header=False)
+            else:
+                warnings.warn(
+                    f"New metrics have been added the the `{file}` csv logs. "
+                    f"Rewriting the csv file. This can take some time..."
+                )
+                # add new columns
+                input_file_df = pd.read_csv(out_path)
+                new_columns = file_df.columns.difference(input_file_df.columns)
+                input_file_df[new_columns] = np.nan
+                input_file_df.to_csv(out_path, mode="w", index=False, header=True)
+
+                # append new logs
+                file_df.to_csv(out_path, mode="a", index=False, header=False)
+                self._columns_counter[file] = file_df.columns.size
+            # if file_df.columns.size != self._columns_counter[file]:
+            #     raise Warning(
+            #         f"Trying to write {file_df.columns.size} metrics {file_df.columns} in {out_path}."
+            #         f" But .csv file was initialized with {self._columns_counter[file]} metrics."
+            #     )
+            # file_df.to_csv(out_path, mode="a", index=False, header=False)
+
+    def _clear(self):
+        for file_content in self.csv_files.values():
+            for column in file_content:
+                file_content[column] = {}
+
+    def close(self):
+        self.save()
+        return super().close()
+    # def add_text(self, tag, text_string, **kwargs):
+    #     
+    #     super().add_text(tag, text_string, **kwargs)

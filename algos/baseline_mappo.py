@@ -21,7 +21,7 @@ from wfcrl.rewards import StepPercentage, RewardShaper
 from wfcrl import environments as envs
 
 from extractors import VectorExtractor
-from utils import plot_env_history
+from utils import LocalSummaryWriter, plot_env_history
 
 
 @dataclass
@@ -195,11 +195,8 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+    writer = LocalSummaryWriter(f"runs/{run_name}")
+    writer.add_config(vars(args))
     model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
     # TRY NOT TO MODIFY
     random.seed(args.seed)

@@ -4,3 +4,4 @@ simulators/*
 __pycache__/*
 wandb/*
 .vscode/*
+algos/private/*

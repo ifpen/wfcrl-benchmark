@@ -19,7 +19,7 @@ from wfcrl.rewards import StepPercentage, RewardShaper
 from wfcrl import environments as envs
 
 from extractors import FourierExtractor, DfacSPaceExtractor
-from utils import plot_env_history
+from utils import LocalSummaryWriter, plot_env_history
 
 
 @dataclass
@@ -209,11 +209,8 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+    writer = LocalSummaryWriter(f"runs/{run_name}")
+    writer.add_config(vars(args))
     # TRY NOT TO MODIFY
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -255,7 +252,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    # set single wind conditions for reproducibiloty
+    # set single wind conditions for reproducibility
     env.reset(options={"wind_speed": 8, "wind_direction": 270})
 
     for step in range(1, args.total_timesteps):

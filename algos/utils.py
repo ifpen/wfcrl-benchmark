@@ -127,7 +127,7 @@ def eval_wind_rose(env, policies, wind_rose, get_action=None):
 
 
 class LocalSummaryWriter(SummaryWriter):
-    def __init__(self, log_dir, max_queue, **kwargs):
+    def __init__(self, log_dir, max_queue=10, **kwargs):
         super().__init__(log_dir, max_queue, **kwargs)
         log_dir = Path(log_dir)
         assert log_dir.is_dir()

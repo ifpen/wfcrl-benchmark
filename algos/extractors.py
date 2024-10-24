@@ -12,24 +12,42 @@ class VectorExtractor(nn.Module):
     """dict-vector mapping for vectors OF DIMENSION 1"""
     def __init__(self, space, filter_out=["pitch", "torque"]):
         super().__init__()
-        lows = []
-        highs = []
         size = 0
         indice = 0
         self.keys = OrderedDict()
-        for item, item_space in space.items():
-            if item not in filter_out:
-                lows.append(item_space.low)
-                highs.append(item_space.high)
-                self.keys[item] = [indice, indice + item_space.shape[0]]
-                size += item_space.shape[0]
-            indice += item_space.shape[0]
+        list_of_params = []
+       
+        if all([isinstance(item_space, gym.spaces.Box) for item_space in space.values()]):
+            self.is_continuous = True
+        elif all([isinstance(item_space, gym.spaces.Discrete) for item_space in space.values()]):
+            self.is_continuous = False
+        else:
+            raise TypeError(f"All spaces in dict must be of same type, Box or Discrete")
 
-        self.space = gym.spaces.Box(
-            low=np.concatenate(lows),
-            high=np.concatenate(highs),
-            shape=(size,)
-        )
+        for item, item_space in space.items():
+            if self.is_continuous:
+                params = (item_space.low, item_space.high)
+                item_shape = item_space.shape[0]
+            else:
+                params = (item_space.n, item_space.start)
+                item_shape = 1
+            if item not in filter_out:                
+                list_of_params.append(params)
+                self.keys[item] = [indice, indice + item_shape]
+                size += item_shape
+            indice += item_shape
+
+        if self.is_continuous:
+            self.space = gym.spaces.Box(
+                low=np.concatenate([params[0] for params in list_of_params]),
+                high=np.concatenate([params[1] for params in list_of_params]),
+                shape=(size,)
+            )
+        else:
+            self.space = gym.spaces.MultiDiscrete(
+                [params[0] for params in list_of_params],
+                start=[params[1] for params in list_of_params]
+            )
 
     def forward(self, dic):
         return np.concatenate([np.atleast_2d(dic[key]) for key in self.keys],1).squeeze()
@@ -45,7 +63,7 @@ class DfacSPaceExtractor(nn.Module):
         super().__init__()
         yaw_space = local_observation_space["yaw"]
         wind_space = global_observation_space["freewind_measurements"]
-        self.observation_space = gym.spaces.Box(
+        self.space = gym.spaces.Box(
             low=np.concatenate([yaw_space.low, wind_space.low]),
             high=np.concatenate([yaw_space.high, wind_space.high]),
             shape=(yaw_space.shape[0] + wind_space.shape[0],)
@@ -130,8 +148,10 @@ class FourierExtractor(nn.Module):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         if (self.hyper and not self.hyper_train):
             self.combin = self.fmat_network(observations[:, 1:])
-        clipped_observations = torch.clip(observations, torch.as_tensor(self.lb[None,:]), torch.as_tensor(self.ub[None,:]))
-        observations = (clipped_observations - self.lb[None,:])/(self.ub[None,:] - self.lb[None,:])
+        lb = torch.as_tensor(self.lb[None,:]).to(observations.device)
+        ub = torch.as_tensor(self.ub[None,:]).to(observations.device)
+        clipped_observations = torch.clip(observations, lb, ub)
+        observations = (clipped_observations - lb)/(ub - lb)
         combin = self.combin.to(observations.dtype).to(observations.device)
         x = (
             torch.bmm(observations[:, None, :], combin.transpose(1,2))

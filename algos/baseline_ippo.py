@@ -290,10 +290,10 @@ if __name__ == "__main__":
             with torch.no_grad():
                 for idagent, agent in enumerate(agents):
                     last_obs, reward, terminations, truncations, infos = env.last()
-                    last_obs = torch.Tensor(partial_obs_extractor(last_obs)).to(device)
+                    last_obs = torch.tensor(partial_obs_extractor(last_obs)).to(device)
                     action, logprob, _, value = agent.get_action_and_value(last_obs)
                     last_done = np.logical_or(terminations, truncations)
-                    last_done = torch.Tensor([last_done.astype(int)]).to(device)
+                    last_done = torch.tensor([last_done.astype(int)]).to(device)
 
                     # store values
                     values[step, :, idagent] = value.flatten()

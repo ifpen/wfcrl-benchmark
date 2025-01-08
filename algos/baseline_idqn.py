@@ -46,7 +46,7 @@ class Args:
     """if toggled, this experiment will be tracked with Weights and Biases"""
     debug_log: bool = False
     """if toggled, will log all power outputs and yaws step by step"""
-    wandb_project_name: str = "Benchmark-WFCRL"
+    wandb_project_name: str = "benchmark-wfcrl-v2"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""

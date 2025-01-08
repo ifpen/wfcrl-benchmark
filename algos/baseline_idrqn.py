@@ -57,6 +57,8 @@ class Args:
     """Number of iterations between eval"""
     wind_data: str = "data/smarteole.csv"
     """Path to wind data for wind rose evaluation"""
+    load_coef: float = 1
+    """coefficient of the load penalty"""
 
     # Algorithm specific arguments
     env_id: str = "Dec_Turb3_Row1_Floris"
@@ -149,7 +151,8 @@ if __name__ == "__main__":
         args.env_id,
         controls=controls, 
         max_num_steps=args.episode_length,
-        continuous_control=False # discrete action space for DQN
+        continuous_control=False, # discrete action space for DQN
+        load_coef=args.load_coef 
     )
     args.num_agents = env.num_turbines
     args.reward_shaping = ""

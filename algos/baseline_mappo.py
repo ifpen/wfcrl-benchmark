@@ -54,6 +54,8 @@ class Args:
     """whether to save model into the `runs/{run_name}` folder"""
     wind_data: str = "data/smarteole.csv"
     """Path to wind data for wind rose evaluation"""
+    load_coef: float = 1
+    """coefficient of the load penalty"""
     episode_length: int = 150
     """side of an trajectory to store in buffer size"""
 
@@ -184,7 +186,8 @@ if __name__ == "__main__":
     env = envs.make(
         args.env_id,
         controls=controls, 
-        max_num_steps=args.episode_length, 
+        max_num_steps=args.episode_length,
+        load_coef=args.load_coef 
     )
     args.num_agents = env.num_turbines
     args.reward_shaping = ""

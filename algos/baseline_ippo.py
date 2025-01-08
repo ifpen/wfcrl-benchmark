@@ -115,6 +115,8 @@ class Args:
     """the number of agents in the environment"""
     reward_shaping: str = ""
     """Toggle learning rate annealing for policy and value networks"""
+    device: str = "cpu"
+    "device"
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -196,6 +198,8 @@ if __name__ == "__main__":
     args.num_agents = env.num_turbines
     args.reward_shaping = "" # reward_shaper.name
     run_name = f"{args.env_id}__{args.exp_name}__{args.scenario}_{args.seed}__{int(time.time())}"
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    args.device = device
     if args.track:
         # os.environ["HTTPS_PROXY"] = "http://irsrvpxw1-std:8082"
         import wandb
@@ -219,9 +223,7 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
-
     
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     obs_space = env.observation_space(env.possible_agents[0])
     action_space_extractor = VectorExtractor(env.action_space(env.possible_agents[0]))
     partial_obs_extractor = VectorExtractor(obs_space)

@@ -251,7 +251,7 @@ if __name__ == "__main__":
         if last_done:
             writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
             writer.add_scalar(f"farm/episode_power", float(cumul_power) / env.max_num_steps, global_step)
-            writer.add_scalar(f"farm/episode_load", float(cumul_load) / args.episode_length, global_step)
+            writer.add_scalar(f"farm/episode_load", float(cumul_load) / env.max_num_steps, global_step)
             writer.add_scalar(f"charts/epsilon", epsilon, global_step)
             cumul_rewards = cumul_power = cumul_load = 0
             if (episode_id % args.freq_eval == 0):

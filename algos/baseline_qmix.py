@@ -461,6 +461,7 @@ if __name__ == "__main__":
                         trajectory_targets.append(target_max)
 
                     input = torch.cat([buffer_obs[b_inds, t, idagent], buffer_actions[b_inds, t-1, idagent]], 1)
+                    #TODO: adapt to multidiscrete
                     action_indices = buffer_actions[b_inds, t, idagent].max(dim=-1)[1][:,None]
                     old_val = q_network(input).gather(1, action_indices).squeeze()
                     trajectory_qval_preds.append(old_val)
@@ -468,8 +469,8 @@ if __name__ == "__main__":
                 targets.append(torch.stack(trajectory_targets, dim=1))
                 qval_preds.append(torch.stack(trajectory_qval_preds, dim=1))
             
-            qval_preds = torch.stack(qval_preds, dim=-1).view(-1,action_one_hot_dim)
-            targets = torch.stack(targets, dim=-1).view(-1,action_one_hot_dim)
+            qval_preds = torch.stack(qval_preds, dim=-1).view(-1,args.num_agents)
+            targets = torch.stack(targets, dim=-1).view(-1,args.num_agents)
             
             with torch.no_grad():
                 b_next_global_obs = buffer_global_obs[b_inds, 2:, :].view((-1,)+global_obs_space.shape)

@@ -24,7 +24,8 @@ from extractors import VectorExtractor
 from utils import (
     LocalSummaryWriter,
     eval_wind_rose,
-    eval_policies,
+    eval_policies, 
+    multidiscrete_one_hot, 
     plot_env_history, 
     prepare_eval_windrose, 
 )
@@ -62,23 +63,23 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = int(1e6)
     """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
+    learning_rate: float = 5e-4 #3e-4 #7e-4 #
     """the learning rate of the optimizer"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    num_envs: int = 1
-    """the number of parallel game environments"""
-    freq_eval: int = 50
-    """Number of iterations between eval"""
+
+    # recurrent learning arguments
+    episode_length: int = 150
+    """side of an trajectory to store in buffer size"""
 
     # DQN arguments
-    buffer_size: int = 10000
+    buffer_size: int = 5000
     """the replay memory buffer size"""
     tau: float = 1.0
     """the target network update rate"""
-    target_network_frequency: int = 500
-    """the timesteps it takes to update the target network"""
-    batch_size: int = 128
+    target_network_frequency: int = 25
+    """the number of episodes it takes to update the target network"""
+    batch_size: int = 32
     """the batch size of sample from the reply memory"""
     start_e: float = 1
     """the starting epsilon for exploration"""
@@ -86,10 +87,8 @@ class Args:
     """the ending epsilon for exploration"""
     exploration_fraction: float = 0.5
     """the fraction of `total-timesteps` it takes from start-e to go end-e"""
-    learning_starts: int = 10000
-    """timestep to start learning"""
-    train_frequency: int = 10
-    """the frequency of training"""
+    learning_starts: int = 200
+    """episodes to start learning"""
     pretrained_models: str = None
     """Path to pretrained models"""
     hidden_layer_nn: Union[bool, tuple[int]] = (64,) #(120, 84)
@@ -105,55 +104,52 @@ class Args:
     device: str = "cpu"
     "device"
 
-class QNetwork(nn.Module):
-    def __init__(self, observation_space, action_space, hidden_layers=(120,84)):
-        super().__init__()
-        self.observation_space = observation_space
-        input_layers = [np.prod(observation_space.shape)] + list(hidden_layers)
-        self.register_buffer(
-            "observation_low", torch.tensor(observation_space.low, dtype=torch.float32)
-        )
-        self.register_buffer(
-            "observation_high", torch.tensor(observation_space.high, dtype=torch.float32)
-        )
 
-        self.network = nn.Sequential(
-            *[
-                nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU())
-                for in_dim, out_dim in zip(input_layers[:-1], input_layers[1:])
-            ],
+class QNetwork(nn.Module):
+    def __init__(self, observation_space, action_space, hidden_dims):
+        super().__init__()
+        action_dim = sum(action_space.nvec)
+        self.observation_space = observation_space
+        self.hidden_dim = hidden_dims[0]
+        self.register_buffer(
+            "input_low", torch.tensor(np.r_[observation_space.low, np.zeros(action_dim)], dtype=torch.float32)
         )
+        self.register_buffer(
+            "input_high", torch.tensor(np.r_[observation_space.high, np.ones(action_dim)], dtype=torch.float32)
+        )
+        self.l1 = nn.Linear(np.prod(observation_space.shape) + action_dim, hidden_dims[0])
+        self.rnn = nn.GRUCell(self.hidden_dim, self.hidden_dim)
         self.output_layers = nn.ModuleList([
-            nn.Linear(input_layers[-1], space.n)
+            nn.Linear(hidden_dims[-1], space.n)
             for space in action_space
         ])
-        
-    def forward(self, x):
-        x = (x - self.observation_low)/(self.observation_high - self.observation_low)
-        x = self.network(x)
-        x = torch.cat([net(x) for net in self.output_layers])
-        return x
+        self.reset_hidden_state()
 
+    def reset_hidden_state(self, batch_size=1):
+        # https://github.com/oxwhirl/pymarl/blob/master/src/modules/agents/rnn_agent.py
+        self.hidden_state = self.l1.weight.new(batch_size, self.hidden_dim).zero_()
+
+    def forward(self, x):
+        x = (x - self.input_low)/(self.input_high - self.input_low)
+        x = F.relu(self.l1(x)).view(-1, self.hidden_dim)
+        h = self.rnn(x, self.hidden_state.view(-1, self.hidden_dim))
+        q = torch.cat([net(h) for net in self.output_layers])
+        self.hidden_state = h
+        return q
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
 
-def get_deterministic_action(q_network, observation, last_action):
-    observation = torch.tensor(partial_obs_extractor(observation), dtype=torch.float32, device=device)
-    q_values = q_network(observation)
-    action = torch.argmax(q_values, dim=-1).cpu().numpy()
-    return action_space_extractor.make_dict(np.array([action]))
-
 if __name__ == "__main__":
     args = tyro.cli(Args)
     controls = {"yaw": (-40, 40)}
+    assert args.scenario in ["constant", "windrose"]
     env = envs.make(
         args.env_id,
         controls=controls, 
-        max_num_steps=150,
-        continuous_control=False, # discrete action space for DQN
-        # log=False # if we take care of the logging on our own
+        max_num_steps=args.episode_length,
+        continuous_control=False # discrete action space for DQN
     )
     args.num_agents = env.num_turbines
     args.reward_shaping = ""
@@ -175,7 +171,7 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = LocalSummaryWriter(f"runs/{run_name}", )
+    writer = LocalSummaryWriter(f"runs/{run_name}")
     writer.add_config(vars(args))
     model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
     # TRY NOT TO MODIFY
@@ -189,6 +185,18 @@ if __name__ == "__main__":
     partial_obs_extractor = VectorExtractor(obs_space)
     partial_obs_space = partial_obs_extractor.space
     action_space = action_space_extractor.space
+    action_one_hot_dim = sum(action_space.nvec)
+    
+    def get_deterministic_action(q_network, observation, last_action):
+        if last_action is None:
+            last_action = np.zeros(sum(action_space.nvec))
+        else:
+            last_action = multidiscrete_one_hot(action_space_extractor(last_action), action_space)
+        observation = partial_obs_extractor(observation)
+        input = torch.tensor(np.concatenate([observation, last_action]), dtype=torch.float32, device=device)
+        q_values = q_network(input)
+        action = torch.argmax(q_values, dim=-1).cpu().numpy()
+        return action_space_extractor.make_dict(np.array([action]))
     
     hidden_layer_nn = args.hidden_layer_nn if isinstance(args.hidden_layer_nn, tuple) else []
     q_networks = [
@@ -230,38 +238,51 @@ if __name__ == "__main__":
         env.reset(options={"wind_speed": 8, "wind_direction": 270})
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.buffer_size, args.num_agents) + partial_obs_space.shape, device=device)
-    next_obs = torch.zeros((args.buffer_size, args.num_agents) + partial_obs_space.shape, device=device)
-    actions = torch.zeros((args.buffer_size, args.num_agents) + action_space.shape, dtype=torch.int64, device=device)
-    rewards = torch.zeros((args.buffer_size, args.num_agents), device=device)
-    dones = torch.zeros((args.buffer_size, args.num_agents), dtype=torch.int64, device=device)
+    obs = torch.zeros((args.buffer_size, args.episode_length, args.num_agents) + partial_obs_space.shape, dtype=torch.float32, device=device)
+    actions = torch.zeros((args.buffer_size, args.episode_length, args.num_agents) + (action_one_hot_dim,), dtype=torch.int64, device=device)
+    rewards = torch.zeros((args.buffer_size, args.episode_length, args.num_agents), dtype=torch.float32, device=device)
+    dones = torch.zeros((args.buffer_size, args.episode_length, args.num_agents), dtype=torch.int64, device=device)
 
     start_time = time.time()
+
     agents_list = env.possible_agents
     assert len(agents_list) == args.num_agents
     cumul_rewards = 0
     cumul_power = 0
-    episode_id = 0
     last_done = False
+    last_actions = np.zeros((args.num_agents,) + (action_one_hot_dim,))
+    step_in_episode = 0
+    episode_id = 0
+    for q_network in q_networks:
+        q_network.reset_hidden_state()
+
 
     for global_step in range(args.total_timesteps):
         # progressively replace old data to handle non stationarity
         if last_done:
             writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
-            writer.add_scalar(f"farm/episode_power", float(cumul_power) / env.max_num_steps, global_step)
+            writer.add_scalar(f"farm/episode_power", float(cumul_power) / args.episode_length, global_step)
             writer.add_scalar(f"charts/epsilon", epsilon, global_step)
-            cumul_rewards = 0
-            cumul_power = 0
-            if (episode_id % args.freq_eval == 0):
+            for q_network in q_networks:
+                q_network.reset_hidden_state()
+            if episode_id == 0 or (episode_id % args.freq_eval  == 0 and episode_id >= args.learning_starts):
                 print(f"Evaluating at iteration {episode_id}")
                 eval_score = evaluate(env, q_networks)
                 print("Episode:", episode_id, "Score: ", eval_score)
                 writer.add_scalar(f"eval/eval_score", eval_score, global_step)
+                for q_network in q_networks:
+                    q_network.reset_hidden_state()
+            cumul_rewards = 0
+            cumul_power = 0
+            last_actions[:] = 0
             episode_id += 1
-            dones[buffer_id, :] = torch.tensor(1, device=device)
-            env.reset(options={"wind_speed": 8, "wind_direction": 270})
+            step_in_episode = 0
+            if windrose_eval:
+                env.reset(args.seed+episode_id)
+            else:
+                env.reset(options={"wind_speed": 8, "wind_direction": 270})
 
-        buffer_id = global_step % args.buffer_size
+        buffer_id = episode_id % args.buffer_size
 
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
@@ -275,16 +296,23 @@ if __name__ == "__main__":
                 if random.random() < epsilon:
                     action = action_space.sample()
                 else:
-                    q_values = q_network(torch.tensor(last_obs, dtype=torch.float32, device=device))
+                    input = torch.tensor(np.concatenate([last_obs, last_actions[idagent]]), dtype=torch.float32, device=device)
+                    q_values = q_network(input)
                     action = torch.argmax(q_values, dim=-1).cpu().numpy()[None]
-                
                 last_done = np.logical_or(terminations, truncations)
 
+                one_hot_action = np.zeros(action_one_hot_dim)
+                ind = 0
+                for action_n, discrete_act in zip(action_space.nvec, action):
+                    one_hot_action[ind+discrete_act] = 1
+                    ind += action_n
+
                 # store values
-                obs[buffer_id, idagent] = torch.tensor(last_obs, dtype=torch.float32, device=device)
-                dones[buffer_id, idagent] = torch.tensor(int(last_done), dtype=torch.float32, device=device)
-                rewards[buffer_id, idagent] = torch.tensor(reward[0], dtype=torch.float32, device=device)
-                actions[buffer_id, idagent] = torch.tensor(action, dtype=torch.int64, device=device)
+                last_actions[idagent] = one_hot_action
+                obs[buffer_id, step_in_episode, idagent] = torch.tensor(last_obs, dtype=torch.float32, device=device)
+                dones[buffer_id, step_in_episode, idagent] = torch.tensor(int(last_done), dtype=torch.float32, device=device)
+                rewards[buffer_id, step_in_episode, idagent] = torch.tensor(reward[0], dtype=torch.float32, device=device)
+                actions[buffer_id, step_in_episode, idagent] = torch.tensor(one_hot_action, dtype=torch.int64, device=device)
 
                 if "power" in infos:
                     powers.append(infos["power"])
@@ -300,59 +328,76 @@ if __name__ == "__main__":
                     env.step(None)
                 else:
                     env.step(action_space_extractor.make_dict(action))
-
+            
+            step_in_episode += 1
+        
+        
         if args.debug_log:
             writer.add_scalar(f"farm/reward", float(reward[0]), global_step)
+            writer.add_scalar(f"charts/epsilon", epsilon, global_step)
             if "power" in infos:
                 writer.add_scalar(f"farm/power_total", sum(powers), global_step)
         
         cumul_power += sum(powers)
         cumul_rewards += float(reward[0])
     
-        for idagent, agent_name in enumerate(agents_list):
-            next_obs[buffer_id, idagent] = torch.tensor(partial_obs_extractor(env.observe(agent_name)), device=device)
-        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
-        if global_step > args.learning_starts:
-            if global_step % args.train_frequency == 0:
-
-                # data = rb.sample(args.batch_size)
-
-        # Optimizing the value network
-                for idagent, q_network in enumerate(q_networks):
-                    b_inds = np.random.choice(np.arange(min(global_step, args.buffer_size)), args.batch_size)
-
+        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+        # for idagent, agent_name in enumerate(agents_list):
+        #     next_obs[buffer_id, idagent] = torch.tensor(partial_obs_extractor(env.observe(agent_name)), dtype=torch.float32, device=device)
+        # # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+        
+        if (episode_id > args.learning_starts) and last_done:
+            rewards_mean = rewards[:min(episode_id, args.buffer_size), :, 0].flatten().mean()
+            rewards_std = rewards[:min(episode_id, args.buffer_size), :, 0].flatten().std()
+            # Optimizing the value network
+            for idagent, q_network in enumerate(q_networks):
+                b_inds = np.random.choice(np.arange(min(episode_id, args.buffer_size)), args.batch_size)
+                trajectory_targets = []
+                trajectory_qval_preds = []
+                q_network.reset_hidden_state(args.batch_size)
+                target_q_networks[idagent].reset_hidden_state(args.batch_size)
+                for t in range(1, args.episode_length-1):
                     with torch.no_grad():
-                        target_max, _ = target_q_networks[idagent](next_obs[b_inds, idagent]).max(dim=1)
-                        td_target = rewards[b_inds, idagent].flatten() + args.gamma * target_max * (1 - dones[b_inds, idagent].flatten())
-                    old_val = q_network(obs[b_inds, idagent]).gather(1, actions[b_inds, idagent]).squeeze()
-                    loss = F.mse_loss(td_target, old_val)
+                        input = torch.cat([obs[b_inds, t+1, idagent], actions[b_inds, t, idagent]], 1)
+                        target_max, _ = target_q_networks[idagent](input).max(dim=1)
+                        v_next_max = args.gamma * target_max # no done that is not truncated
+                        standard_rewards = (rewards[b_inds, t, idagent] - rewards_mean) / rewards_std
+                        td_target = standard_rewards.flatten() + v_next_max
+                        trajectory_targets.append(td_target)
 
-                    if (global_step - args.learning_starts) % (args.train_frequency * 50) == 0:
-                        writer.add_scalar(f"losses/agent_{idagent}/td_loss", loss.item(), global_step)
-                        writer.add_scalar(f"losses/agent_{idagent}/q_values", old_val.mean().item(), global_step)
-                        # print("SPS:", int(global_step / (time.time() - start_time)))
+                    input = torch.cat([obs[b_inds, t, idagent], actions[b_inds, t-1, idagent]], 1)
+                    indices = actions[b_inds, t, idagent].max(dim=-1)[1][:,None]
+                    old_val = q_network(input).gather(1, indices).flatten()
+                    trajectory_qval_preds.append(old_val)
 
-                    # optimize the model
-                    optimizers[idagent].zero_grad()
-                    loss.backward()
-                    optimizers[idagent].step()
+                trajectory_targets = torch.stack(trajectory_targets, dim=1).view(-1)
+                trajectory_qval_preds = torch.stack(trajectory_qval_preds, dim=1).view(-1)
+                loss = F.mse_loss(trajectory_targets, trajectory_qval_preds)
 
-                    # update target network
-            if global_step % args.target_network_frequency == 0:
+                if episode_id % 5 == 0:
+                    writer.add_scalar(f"losses/agent_{idagent}/td_loss", loss.item(), global_step)
+                    writer.add_scalar(f"losses/agent_{idagent}/q_values", old_val.mean().item(), global_step)
+
+                # optimize the model
+                optimizers[idagent].zero_grad()
+                loss.backward()
+                optimizers[idagent].step()
+
+                # update target network
+            if episode_id % args.target_network_frequency == 0:
                 for q_network, target_network in zip(q_networks, target_q_networks):
                     for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
                         target_network_param.data.copy_(
                             args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                         )
 
-        if (global_step % 10000 == 0):
-            print("SPS:", int(global_step / (time.time() - start_time)))
-            writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-            if args.save_model:
+            if episode_id % 100 == 0 and args.save_model:
                 for idagent, q_network in enumerate(q_networks):
                     torch.save(q_network.state_dict(), model_path+f"_{idagent}")
                 # torch.save(shared_critic.state_dict(), model_path+f"_critic")
                 print(f"model saved to {model_path}")
+                print("SPS:", int(global_step / (time.time() - start_time)))
+                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
 env.close()
 for idagent, q_network in enumerate(q_networks):
@@ -365,5 +410,3 @@ writer.close()
 # Prepare plots
 fig = plot_env_history(env)
 fig.savefig(f"runs/{run_name}/plot.png")
-
-print("stop")

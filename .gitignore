@@ -5,3 +5,5 @@ __pycache__/*
 wandb/*
 .vscode/*
 algos/private/*
+layouts/*
+*.pyc

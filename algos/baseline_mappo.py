@@ -294,16 +294,16 @@ if __name__ == "__main__":
             if last_done:
                 writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
                 writer.add_scalar(f"farm/episode_power", float(cumul_power) / args.episode_length, global_step)
+                writer.add_scalar(f"farm/episode_load", float(cumul_load) / args.episode_length, global_step)
             if last_done or step == 0:
                 if windrose_eval:
                     env.reset(args.seed+global_step)
                 else:
                     env.reset(options={"wind_speed": 8, "wind_direction": 270})
-                cumul_rewards = 0
-                cumul_power = 0
+                cumul_rewards = cumul_power = cumul_load = 0
             global_step += args.num_envs
             powers = []
-
+            loads = []
             with torch.no_grad():
                 last_global_obs = env.state()
                 last_global_obs = torch.tensor(global_obs_extractor(last_global_obs), dtype=torch.float32, device=device)
@@ -323,6 +323,8 @@ if __name__ == "__main__":
                     rewards[step, :, idagent] = torch.tensor(reward, dtype=torch.float32, device=device).view(-1)
                     if "power" in infos:
                         powers.append(infos["power"])
+                    if "load" in infos:
+                        loads.append(float(np.mean(np.abs(infos["load"]))))
                     if args.debug_log:
                         if "power" in infos:
                             writer.add_scalar(f"farm/power_T{idagent}", infos["power"], global_step)
@@ -342,6 +344,7 @@ if __name__ == "__main__":
                     writer.add_scalar(f"farm/power_total", sum(powers), global_step)
             step += 1
             cumul_power += sum(powers)
+            cumul_load += sum(loads)
             cumul_rewards += float(reward[0])
 
         # bootstrap value for all agents and compute GAE

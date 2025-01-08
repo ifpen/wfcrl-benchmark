@@ -239,8 +239,7 @@ if __name__ == "__main__":
     start_time = time.time()
     agents_list = env.possible_agents
     assert len(agents_list) == args.num_agents
-    cumul_rewards = 0
-    cumul_power = 0
+    cumul_rewards = cumul_power = cumul_load = 0
     episode_id = 0
     last_done = False
 
@@ -249,9 +248,9 @@ if __name__ == "__main__":
         if last_done:
             writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
             writer.add_scalar(f"farm/episode_power", float(cumul_power) / env.max_num_steps, global_step)
+            writer.add_scalar(f"farm/episode_load", float(cumul_load) / args.episode_length, global_step)
             writer.add_scalar(f"charts/epsilon", epsilon, global_step)
-            cumul_rewards = 0
-            cumul_power = 0
+            cumul_rewards = cumul_power = cumul_load = 0
             if (episode_id % args.freq_eval == 0):
                 print(f"Evaluating at iteration {episode_id}")
                 eval_score = evaluate(env, q_networks)
@@ -268,6 +267,7 @@ if __name__ == "__main__":
         
         # ALGO LOGIC: action logic
         powers = []
+        loads = []
         with torch.no_grad():
             for idagent, q_network in enumerate(q_networks):
                 last_obs, reward, terminations, truncations, infos = env.last()
@@ -288,6 +288,8 @@ if __name__ == "__main__":
 
                 if "power" in infos:
                     powers.append(infos["power"])
+                if "load" in infos:
+                    loads.append(float(np.mean(np.abs(infos["load"]))))
                 if args.debug_log:
                     if "power" in infos:
                         writer.add_scalar(f"farm/power_T{idagent}", infos["power"], global_step)
@@ -307,6 +309,7 @@ if __name__ == "__main__":
                 writer.add_scalar(f"farm/power_total", sum(powers), global_step)
         
         cumul_power += sum(powers)
+        cumul_load += sum(loads)
         cumul_rewards += float(reward[0])
     
         for idagent, agent_name in enumerate(agents_list):

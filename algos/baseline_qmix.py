@@ -327,8 +327,7 @@ if __name__ == "__main__":
     start_time = time.time()
     agents_list = env.possible_agents
     assert len(agents_list) == args.num_agents
-    cumul_rewards = 0
-    cumul_power = 0
+    cumul_rewards = cumul_power = cumul_load = 0
     episode_id = 0
     last_done = False
     pt = 0
@@ -344,6 +343,7 @@ if __name__ == "__main__":
         if last_done:
             writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
             writer.add_scalar(f"farm/episode_power", float(cumul_power) / args.episode_length, global_step)
+            writer.add_scalar(f"farm/episode_load", float(cumul_load) / args.episode_length, global_step)
             writer.add_scalar(f"charts/epsilon", epsilon, global_step)
             for q_network in q_networks:
                 q_network.reset_hidden_state()
@@ -354,8 +354,7 @@ if __name__ == "__main__":
                 writer.add_scalar(f"eval/eval_score", eval_score, global_step)
                 for q_network in q_networks:
                     q_network.reset_hidden_state()
-            cumul_rewards = 0
-            cumul_power = 0
+            cumul_rewards = cumul_power = cumul_load = 0
             actions[:] = 0
             pt = 0
             episode_id += 1
@@ -369,6 +368,7 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: action logic
         powers = []
+        loads = []
         with torch.no_grad():
             last_global_obs = env.state()
             last_global_obs = torch.tensor(global_obs_extractor(last_global_obs), dtype=torch.float32, device=device)
@@ -399,6 +399,8 @@ if __name__ == "__main__":
 
                 if "power" in infos:
                     powers.append(infos["power"])
+                if "load" in infos:
+                    loads.append(float(np.mean(np.abs(infos["load"]))))
                 if args.debug_log:
                     if "power" in infos:
                         writer.add_scalar(f"farm/power_T{idagent}", infos["power"], global_step)
@@ -416,6 +418,7 @@ if __name__ == "__main__":
             if "power" in infos:
                 writer.add_scalar(f"farm/power_total", sum(powers), global_step)
         cumul_power += sum(powers)
+        cumul_load += sum(loads)
         cumul_rewards += float(reward[0])
 
     

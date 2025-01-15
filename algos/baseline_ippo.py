@@ -87,15 +87,15 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    num_envs: int = 1
-    """the number of parallel game environments"""
+    fine_tuning_freeze: bool = False
+    """fine tunes pretrained model"""
 
     # DFAC arguments
     pretrained_models: str = None
     """Path to pretrained models"""
     policy: str = "base"
     """Type of policy"""
-    hidden_layer_nn: Union[bool, tuple[int]] = (64, 64)
+    hidden_layer_nn: Union[bool, tuple[int, ...]] = (64, 64)
     """number of neurons in hidden layer"""
     num_steps: int = 2048
     """number of available rewards before update"""
@@ -186,19 +186,21 @@ if __name__ == "__main__":
     args = tyro.cli(Args)
     controls = ["yaw"]
     assert args.scenario in ["constant", "windrose"]
-    args.batch_size = int(args.num_envs * args.num_steps)
+    args.batch_size = int(args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+    num_episodes = int(np.ceil(args.num_steps / (args.episode_length-1)))
     env = envs.make(
         args.env_id,
         controls=controls, 
         max_num_steps=args.episode_length,
-        load_coef=args.load_coef 
+        load_coef=args.load_coef
     )
     args.num_agents = env.num_turbines
     args.reward_shaping = "" # reward_shaper.name
     run_name = f"{args.env_id}__{args.exp_name}__{args.scenario}_{args.seed}__{int(time.time())}"
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    # device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     args.device = device
     if args.track:
         # os.environ["HTTPS_PROXY"] = "http://irsrvpxw1-std:8082"
@@ -250,6 +252,18 @@ if __name__ == "__main__":
             params = torch.load(str(path), map_location='cpu')
             agent.load_state_dict(params)
 
+            if args.fine_tuning_freeze:
+                for p in agent.critic[0].parameters():
+                    p.requires_grad = False
+                for p in agent.actor[0].parameters():
+                    p.requires_grad = False
+                # Correct optimizers to account for parameter freeze
+                optimizers[idagent] = optim.Adam(
+                    [p for p in agent.parameters() if p.requires_grad],
+                    lr=args.learning_rate, 
+                    eps=1e-5
+                )
+
     def get_deterministic_action(agent, observation, last_action=None):
         observation = torch.Tensor(partial_obs_extractor(observation)).to(device)
         action, _, _, _= agent.get_action_and_value(observation, deterministic=True)
@@ -260,19 +274,18 @@ if __name__ == "__main__":
         windrose = prepare_eval_windrose(args.wind_data, num_bins=5)
         def evaluate(eval_env, eval_agents):
             return eval_wind_rose(eval_env, eval_agents, windrose, get_deterministic_action)[0]
-        env.reset(args.seed)
     else:
         def evaluate(eval_env, eval_agents):
             return eval_policies(eval_env, eval_agents, get_deterministic_action)
-        env.reset(options={"wind_speed": 8, "wind_direction": 270})
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs, args.num_agents) + partial_obs_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs, args.num_agents) + action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs, args.num_agents)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs, args.num_agents)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs, args.num_agents)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs, args.num_agents)).to(device)
+    obs = torch.zeros((args.episode_length, num_episodes, args.num_agents) + partial_obs_space.shape).to(device)
+    actions = torch.zeros((args.episode_length, num_episodes, args.num_agents) + action_space.shape).to(device)
+    logprobs = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
+    rewards = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
+    dones = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
+    terminations = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
+    values = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -293,9 +306,11 @@ if __name__ == "__main__":
             for optimizer in optimizers:
                 optimizer.param_groups[0]["lr"] = lrnow
 
-        step = 0
+        step = pt = episode_id = 0
         while step < args.num_steps:
             if last_done:
+                episode_id += 1
+                pt = 0
                 writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
                 writer.add_scalar(f"farm/episode_power", float(cumul_power) / args.episode_length, global_step)
                 writer.add_scalar(f"farm/episode_load", float(cumul_load) / args.episode_length, global_step)
@@ -305,24 +320,26 @@ if __name__ == "__main__":
                 else:
                     env.reset(options={"wind_speed": 8, "wind_direction": 270})
                 cumul_rewards = cumul_power = cumul_load = 0
-            global_step += args.num_envs
+            global_step += 1
             powers = []
             loads = []
 
             with torch.no_grad():
                 for idagent, agent in enumerate(agents):
-                    last_obs, reward, terminations, truncations, infos = env.last()
+                    last_obs, reward, termination, truncation, infos = env.last()
                     last_obs = torch.tensor(partial_obs_extractor(last_obs), dtype=torch.float32, device=device)
                     action, logprob, _, value = agent.get_action_and_value(last_obs)
-                    last_done = np.logical_or(terminations, truncations)
+                    last_done = np.logical_or(termination, truncation)
                     
                     # store values
-                    values[step, :, idagent] = value.flatten()
-                    logprobs[step, :, idagent] = logprob
-                    obs[step, :, idagent] = last_obs
-                    dones[step, :, idagent] = torch.tensor([last_done.astype(int)], dtype=torch.float32, device=device)
-                    rewards[step, :, idagent] = torch.tensor(reward, dtype=torch.float32, device=device).view(-1)
-                    
+                    values[pt, episode_id, idagent] = value.flatten()
+                    logprobs[pt, episode_id, idagent] = logprob
+                    obs[pt, episode_id, idagent] = last_obs
+                    dones[pt, episode_id, idagent] = torch.tensor([last_done.astype(int)], device=device)
+                    terminations[pt, episode_id, idagent] = torch.tensor(int(termination), device=device)
+                    rewards[pt, episode_id, idagent] = torch.tensor(reward, dtype=torch.float32, device=device).view(-1)
+                    actions[pt, episode_id, idagent] = action
+
                     if "power" in infos:
                         powers.append(infos["power"])
                     if "load" in infos:
@@ -339,41 +356,48 @@ if __name__ == "__main__":
                         env.step(None)
                     else:
                         env.step(action_space_extractor.make_dict(action))
-                    actions[step, :, idagent] = action
                 
             if args.debug_log:
                 writer.add_scalar(f"farm/reward", float(reward[0]), global_step)
                 if "power" in infos:
                     writer.add_scalar(f"farm/power_total", sum(powers), global_step)
 
-            step += 1
+            step += int(not last_done)
+            pt += 1
             cumul_power += sum(powers)
             cumul_load += sum(loads)
             cumul_rewards += float(reward[0])
 
+        # normalize rewards
+        rewards_mean = rewards[:, :, 0].flatten()[:-(args.episode_length - pt)].mean()
+        rewards_std = rewards[:, :, 0].flatten()[:-(args.episode_length - pt)].std()
+        rewards = (rewards - rewards_mean) / (rewards_std + 1e-8)
+
         # bootstrap value for all agents and compute GAE
-        lastgaelam = torch.zeros((args.num_envs, args.num_agents)).to(device)
+        dones[pt-1, episode_id, :] = 1
+        lastgaelam = torch.zeros((num_episodes, args.num_agents)).to(device)
         advantages = torch.zeros_like(rewards).to(device)
         with torch.no_grad():
-            for t in reversed(range(0, args.num_steps-1)):
+            for t in reversed(range(0, args.episode_length-1)):
                 nextvalues = values[t + 1]
-                nextnonterminal = 1.0 - dones[t + 1]
+                nextnonterminal = 1.0 - terminations[t + 1]
+                nextbootstrap = 1.0 - dones[t + 1]
                 delta = rewards[t + 1] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextbootstrap * lastgaelam
             returns = advantages + values
 
         # flatten the batch
-        b_obs = obs[:-1].reshape((-1,args.num_agents) + partial_obs_space.shape)
-        b_logprobs = logprobs[:-1].reshape(-1, args.num_agents)
-        b_actions = actions[:-1].reshape((-1, args.num_agents) + action_space.shape)
-        b_advantages = advantages[:-1].reshape(-1, args.num_agents)
-        b_returns = returns[:-1].reshape(-1, args.num_agents)
-        b_values = values[:-1].reshape(-1, args.num_agents)
+        b_obs = obs[:-1].transpose(0,1).reshape((-1,args.num_agents) + partial_obs_space.shape)[:args.batch_size]
+        b_logprobs = logprobs[:-1].transpose(0,1).reshape(-1, args.num_agents)[:args.batch_size]
+        b_actions = actions[:-1].transpose(0,1).reshape((-1, args.num_agents) + action_space.shape)[:args.batch_size]
+        b_advantages = advantages[:-1].transpose(0,1).reshape(-1, args.num_agents)[:args.batch_size]
+        b_returns = returns[:-1].transpose(0,1).reshape(-1, args.num_agents)[:args.batch_size]
+        b_values = values[:-1].transpose(0,1).reshape(-1, args.num_agents)[:args.batch_size]
 
         # Optimizing the policy and value network
 
         for idagent, agent in enumerate(agents):
-            b_inds = np.arange(args.batch_size-1)
+            b_inds = np.arange(args.batch_size)
             clipfracs = []
             for epoch in range(args.update_epochs):
                 np.random.shuffle(b_inds)

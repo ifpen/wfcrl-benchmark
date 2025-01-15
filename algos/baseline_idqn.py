@@ -360,16 +360,14 @@ if __name__ == "__main__":
                 # torch.save(shared_critic.state_dict(), model_path+f"_critic")
                 print(f"model saved to {model_path}")
 
-env.close()
-for idagent, q_network in enumerate(q_networks):
-    torch.save(q_network.state_dict(), model_path+f"_{idagent}")
-# torch.save(shared_critic.state_dict(), model_path+f"_critic")
-print(f"model saved to {model_path}")
-writer.close()
+    env.close()
+    for idagent, q_network in enumerate(q_networks):
+        torch.save(q_network.state_dict(), model_path+f"_{idagent}")
+    # torch.save(shared_critic.state_dict(), model_path+f"_critic")
+    print(f"model saved to {model_path}")
+    writer.close()
 
 
-# Prepare plots
-fig = plot_env_history(env)
-fig.savefig(f"runs/{run_name}/plot.png")
-
-print("stop")
+    # Prepare plots
+    fig = plot_env_history(env)
+    fig.savefig(f"runs/{run_name}/plot.png")

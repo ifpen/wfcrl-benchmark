@@ -15,8 +15,6 @@ Algorithms:
 | IFAC           | `algos/ifac.py`     | Simple online actor critic with Fourier Basis     |
 | IQN           | `algos/idqn.py`     | Simple independent DQN    |
 
-Scripts with the `windrose` suffix train under *Wind Scenario II*. Other implement *Wind Snecario I*.
-
 Install the dependencies:
 ```
 pip install -r requirements
@@ -34,8 +32,11 @@ Evaluate it on the on the `Dec_Ablaincourt_Fastfarm` environment:
 mpiexec -n 1 python algos/eval.py --seed 0 --env_id Dec_Ablaincourt_Fastfarm --total_timesteps 10000 --pretrained_models path/to/run
 ```
 
-Experiments for training and evaluation runs are in the `scripts` folder.
+Experiments for training and evaluation runs are in the `scripts` folder. Add `--scenario windrose` to train/eval on *Wind Scenario II*:
 
+```
+python algos/baseline_ippo.py --seed 1 --env_id Dec_Ablaincourt_Floris --total_timesteps 1000000 --scenario windrose
+```
 
 To track the experiment in Wandb, add your API key in an `.env` file at the root of the folder:
 

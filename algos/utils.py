@@ -68,14 +68,19 @@ def get_wake_delays(cx, cy, uref, phiref=0, gamma=4, stab_time = 80, cutoff_x=20
 
 def multi_agent_step_routine(env, policies, get_action=None):
     r = {agent: 0 for agent in env.possible_agents}
+    actions = {agent: None for agent in env.possible_agents}
     if get_action is None:
         def get_action(agt, obs):
             return agt(obs)
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
         r[agent] += reward
-        action = get_action(policies[env.agent_name_mapping[agent]], observation)
+        if termination or truncation:
+            action = None
+        else:
+            action = get_action(policies[env.agent_name_mapping[agent]], observation, actions[agent])
         env.step(action)
+        actions[agent] = action
     return r
 
 def prepare_eval_windrose(path, num_bins=5):
@@ -94,6 +99,12 @@ def prepare_eval_windrose(path, num_bins=5):
     freq = counts / np.sum(counts)
     return freq, wd_bins, ws_bins
     
+def eval_policies(env, policies, get_action=None):
+    env.reset(options={"wind_speed": 8, "wind_direction": 270})
+    r = multi_agent_step_routine(env, policies, get_action=get_action)
+    # all policies have received the same reward
+    r = float(list(r.values())[0])
+    return r
 
 def eval_wind_rose(env, policies, wind_rose, get_action=None):
     """
@@ -120,11 +131,19 @@ def eval_wind_rose(env, policies, wind_rose, get_action=None):
             env.reset(options={"wind_speed": ws, "wind_direction": wd})
             r = multi_agent_step_routine(env, policies, get_action=get_action)
             # all policies have received the same reward
-            r = float(r[env.possible_agents[0]])
+            r = float(list(r.values())[0]) #r = float(r[env.possible_agents[0]])
             episode_rewards.append(r)
             score += freq[i, j] * r
     return score, np.array(episode_rewards)
 
+def multidiscrete_one_hot(action, action_space):
+    one_hot_action = np.zeros(sum(action_space.nvec))
+    action = np.atleast_1d(action)
+    ind = 0
+    for action_n, discrete_act in zip(action_space.nvec, action):
+        one_hot_action[ind+discrete_act] = 1
+        ind += action_n
+    return one_hot_action
 
 class LocalSummaryWriter(SummaryWriter):
     def __init__(self, log_dir, max_queue=10, **kwargs):

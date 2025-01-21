@@ -21,13 +21,21 @@ from wfcrl.rewards import StepPercentage, RewardShaper
 from wfcrl import environments as envs
 
 from extractors import VectorExtractor
-from utils import LocalSummaryWriter, plot_env_history
+from utils import (
+    LocalSummaryWriter,
+    eval_wind_rose,
+    eval_policies, 
+    plot_env_history, 
+    prepare_eval_windrose, 
+)
 
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
+    scenario: str = "constant"
+    """the name of the scenario, identified by the wind series"""
     seed: int = 1
     """seed of the experiment"""
     torch_deterministic: bool = True
@@ -36,17 +44,25 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "Benchmark-WFCRL"
+    debug_log: bool = False
+    """if toggled, will log all power outputs and yaws step by step"""
+    wandb_project_name: str = "benchmark-wfcrl-v2"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
     save_model: bool = True
     """whether to save model into the `runs/{run_name}` folder"""
+    wind_data: str = "data/smarteole.csv"
+    """Path to wind data for wind rose evaluation"""
+    load_coef: float = 1
+    """coefficient of the load penalty"""
+    episode_length: int = 150
+    """side of an trajectory to store in buffer size"""
 
     # Algorithm specific arguments
     env_id: str = "Dec_Turb3_Row1_Floris"
     """the id of the environment"""
-    total_timesteps: int = int(5e4)
+    total_timesteps: int = int(1e5)
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4 #7e-4 #
     """the learning rate of the optimizer"""
@@ -70,28 +86,20 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    num_envs: int = 1
-    """the number of parallel game environments"""
 
     # DFAC arguments
     pretrained_models: str = None
     """Path to pretrained models"""
-    kl_coef:  float = 0.0
-    """Weighing coefficient for KL term in loss """ 
     policy: str = "base"
     """Type of policy"""
-    adaptive_explo: bool = False
-    """Use counter_based exploration"""
-    multi_scale: bool = False
-    """Use multi scale algorithm"""
-    hidden_layer_nn: Union[bool, tuple[int]] = (64, 64)
+    hidden_layer_nn: Union[bool, Union[bool, tuple[int, ...]]] = (64, 64)
     """number of neurons in hidden layer"""
-    debug: bool = False
-    """debug mode saves monitoring logs during training"""
-    num_steps: int = 2048 #1
+    num_steps: int = 2048
     """number of available rewards before update"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
+    freq_eval: int = 5
+    """Number of iterations between eval"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -104,6 +112,8 @@ class Args:
     """the number of agents in the environment"""
     reward_shaping: str = ""
     """Toggle learning rate annealing for policy and value networks"""
+    device: str = "cpu"
+    "device"
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -169,17 +179,22 @@ class Agent(nn.Module):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     controls = ["yaw"]
-    args.batch_size = int(args.num_envs * args.num_steps)
+    assert args.scenario in ["constant", "windrose"]
+    args.batch_size = int(args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+    num_episodes = int(np.ceil(args.num_steps / (args.episode_length-1)))
     env = envs.make(
         args.env_id,
         controls=controls, 
-        max_num_steps=args.num_steps, 
+        max_num_steps=args.episode_length,
+        load_coef=args.load_coef
     )
     args.num_agents = env.num_turbines
     args.reward_shaping = ""
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.scenario}_{args.seed}__{int(time.time())}"
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    args.device = device
     if args.track:
         # os.environ["HTTPS_PROXY"] = "http://irsrvpxw1-std:8082"
         import wandb
@@ -205,7 +220,6 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     obs_space = env.observation_space(env.possible_agents[0])
     action_space_extractor = VectorExtractor(env.action_space(env.possible_agents[0]))
     partial_obs_extractor = VectorExtractor(obs_space)
@@ -235,105 +249,140 @@ if __name__ == "__main__":
                 raise FileNotFoundError(f"No file in model_{idagent} found under folder {args.pretrained_models}")
             params = torch.load(str(path), map_location='cpu')
             agent.load_state_dict(params)
+    
+    def get_deterministic_action(agent, observation, last_action=None):
+        observation = torch.Tensor(partial_obs_extractor(observation)).to(device)
+        action, _, _ = agent.get_action(observation, deterministic=True)
+        return action_space_extractor.make_dict(action)
+    
+    windrose_eval = args.scenario == "windrose"
+    if windrose_eval:
+        windrose = prepare_eval_windrose(args.wind_data, num_bins=5)
+        def evaluate(eval_env, eval_agents):
+            return eval_wind_rose(eval_env, eval_agents, windrose, get_deterministic_action)[0]
+        env.reset(args.seed)
+    else:
+        def evaluate(eval_env, eval_agents):
+            return eval_policies(eval_env, eval_agents, get_deterministic_action)
+        env.reset(options={"wind_speed": 8, "wind_direction": 270})
 
     # ALGO Logic: Storage setup
-    global_obs = torch.zeros((args.num_steps+1, args.num_envs) + global_obs_space.shape).to(device)
-    obs = torch.zeros((args.num_steps+1, args.num_envs, args.num_agents) + partial_obs_space.shape).to(device)
-    actions = torch.zeros((args.num_steps+1, args.num_envs, args.num_agents) + action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps+1, args.num_envs, args.num_agents)).to(device)
-    rewards = torch.zeros((args.num_steps+1, args.num_envs, args.num_agents)).to(device)
-    dones = torch.zeros((args.num_steps+1, args.num_envs, args.num_agents)).to(device)
-    values = torch.zeros((args.num_steps+1, args.num_envs, args.num_agents)).to(device)
+    global_obs = torch.zeros((args.episode_length, args.num_steps) + global_obs_space.shape).to(device)
+    obs = torch.zeros((args.episode_length, num_episodes, args.num_agents) + partial_obs_space.shape).to(device)
+    actions = torch.zeros((args.episode_length, num_episodes, args.num_agents) + action_space.shape).to(device)
+    logprobs = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
+    rewards = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
+    dones = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
+    terminations = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
+    values = torch.zeros((args.episode_length, num_episodes, args.num_agents)).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()    
 
-    for iteration in range(1, args.num_iterations + 1):
-        env.reset(options={"wind_speed": 8, "wind_direction": 270})
-        # env.reset(seed=args.seed)
-        # env.reset()
+    for iteration in range(args.num_iterations):
+        if iteration % args.freq_eval  == 0:
+            print(f"Evaluating at iteration {iteration}")
+            eval_score = evaluate(env, agents)
+            print("Episode:", iteration, "Score: ", eval_score)
+            writer.add_scalar(f"eval/eval_score", eval_score, global_step)
 
-        cumul_rewards = 0
-        cumul_power = 0
+        last_done = False
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            frac = 1.0 - iteration / args.num_iterations
             lrnow = frac * args.learning_rate
             for optimizer in actor_optimizers + [critic_optimizer]:
                 optimizer.param_groups[0]["lr"] = lrnow
 
-        values[0] = values[-1]
-        logprobs[0] = logprobs[-1]
-        obs[0] = obs[-1]
-        dones[0] = dones[-1]
-        rewards[0] = rewards[-1]
-        actions[0] = actions[-1]
-
-        for step in range(1, args.num_steps+1):
-
-            global_step += args.num_envs
-            # obs = next_obs
-
-            # ALGO LOGIC: action logic
+        step = pt = episode_id = 0
+        while step < args.num_steps:
+            if last_done:
+                episode_id += 1
+                pt = 0
+                writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
+                writer.add_scalar(f"farm/episode_power", float(cumul_power) / args.episode_length, global_step)
+                writer.add_scalar(f"farm/episode_load", float(cumul_load) / args.episode_length, global_step)
+            if last_done or step == 0:
+                if windrose_eval:
+                    env.reset(args.seed+global_step)
+                else:
+                    env.reset(options={"wind_speed": 8, "wind_direction": 270})
+                cumul_rewards = cumul_power = cumul_load = 0
+            global_step += 1
             powers = []
-
+            loads = []
             with torch.no_grad():
                 last_global_obs = env.state()
-                last_global_obs = torch.Tensor(global_obs_extractor(last_global_obs)).to(device)
+                last_global_obs = torch.tensor(global_obs_extractor(last_global_obs), dtype=torch.float32, device=device)
                 value = shared_critic.get_value(last_global_obs)
-                global_obs[step, :] = last_global_obs
-                values[step, :, :] = value.flatten()
+                global_obs[pt, episode_id, :] = last_global_obs
+                values[pt, episode_id, :] = value.flatten()
                 for idagent, agent in enumerate(agents):
-                    last_obs, reward, terminations, truncations, infos = env.last()
-                    last_obs = torch.Tensor(partial_obs_extractor(last_obs)).to(device)
+                    last_obs, reward, termination, truncation, infos = env.last()
+                    last_obs = torch.tensor(partial_obs_extractor(last_obs), dtype=torch.float32, device=device)
                     action, logprob, _ = agent.get_action(last_obs)
-                    last_done = np.logical_or(terminations, truncations)
-                    last_done = torch.Tensor([last_done.astype(int)]).to(device)
-
-                    logprobs[step, :, idagent] = logprob
-                    obs[step, :, idagent] = last_obs
-                    dones[step, :, idagent] = last_done
-                    rewards[step, :, idagent] = torch.tensor(reward).to(device).view(-1)
+                    last_done = np.logical_or(termination, truncation)
+                    
+                    # store values
+                    logprobs[pt, episode_id, idagent] = logprob
+                    obs[pt, episode_id, idagent] = last_obs
+                    dones[pt, episode_id, idagent] = torch.tensor([last_done.astype(int)], device=device)
+                    rewards[pt, episode_id, idagent] = torch.tensor(reward, dtype=torch.float32, device=device).view(-1)
+                    actions[pt, episode_id, idagent] = action
                     if "power" in infos:
                         powers.append(infos["power"])
-                        writer.add_scalar(f"farm/power_T{idagent}", infos["power"], global_step)
                     if "load" in infos:
-                        writer.add_scalar(f"farm/load_T{idagent}", sum(np.abs(infos["load"])), global_step)
-                    writer.add_scalar(f"farm/controls/yaw_T{idagent}", last_obs[0].item(), global_step)
+                        loads.append(float(np.mean(np.abs(infos["load"]))))
+                    if args.debug_log:
+                        if "power" in infos:
+                            writer.add_scalar(f"farm/power_T{idagent}", infos["power"], global_step)
+                        if "load" in infos:
+                            writer.add_scalar(f"farm/load_T{idagent}", sum(np.abs(infos["load"])), global_step)
+                        writer.add_scalar(f"farm/controls/yaw_T{idagent}", last_obs[0].item(), global_step)
+                        writer.add_scalar(f"charts/action/yaw_T{idagent}", action[0], global_step)
 
-                    # store next action
-                    env.step(action_space_extractor.make_dict(action))
-                    actions[step, :, idagent] = action
-                writer.add_scalar(f"farm/reward", float(reward[0]), global_step)
-            
-            if "power" in infos:
-                writer.add_scalar(f"farm/power_total", sum(powers), global_step)
-                cumul_power += sum(powers)
+                    if last_done:
+                        env.step(None)
+                    else:
+                        env.step(action_space_extractor.make_dict(action))
+                    
+            if args.debug_log:
+                writer.add_scalar(f"farm/reward", float(reward[0]), global_step)  
+                if "power" in infos:
+                    writer.add_scalar(f"farm/power_total", sum(powers), global_step)
+            step += int(not last_done)
+            pt += 1
+            cumul_power += sum(powers)
+            cumul_load += sum(loads)
             cumul_rewards += float(reward[0])
 
+        # normalize rewards
+        rewards_mean = rewards[:, :, 0].flatten()[:-(args.episode_length - pt)].mean()
+        rewards_std = rewards[:, :, 0].flatten()[:-(args.episode_length - pt)].std()
+        rewards = (rewards - rewards_mean) / (rewards_std + 1e-8)
 
-        writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
-        writer.add_scalar(f"farm/episode_power", float(cumul_power) / args.num_steps, global_step)
         # bootstrap value for all agents and compute GAE
-        lastgaelam = torch.zeros((args.num_envs, args.num_agents)).to(device)
+        dones[pt-1, episode_id, :] = 1
+        lastgaelam = torch.zeros((num_episodes, args.num_agents)).to(device)
         advantages = torch.zeros_like(rewards).to(device)
         with torch.no_grad():
-            for t in reversed(range(0, args.num_steps)):
+            for t in reversed(range(0, args.episode_length-1)):
                 nextvalues = values[t + 1]
-                nextnonterminal = 1.0 - dones[t + 1]
+                nextnonterminal = 1.0 - terminations[t + 1]
+                nextbootstrap = 1.0 - dones[t + 1]
                 delta = rewards[t + 1] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextbootstrap * lastgaelam
             returns = advantages + values
 
         # flatten the batch
-        b_global_obs = global_obs[:-1].reshape((-1,) + global_obs_space.shape)
-        b_obs = obs[:-1].reshape((-1, args.num_agents) + partial_obs_space.shape)
-        b_logprobs = logprobs[:-1].reshape(-1, args.num_agents)
-        b_actions = actions[:-1].reshape((-1, args.num_agents) + action_space.shape)
-        b_advantages = advantages[:-1].reshape(-1, args.num_agents)
-        b_returns = returns[:-1].reshape(-1, args.num_agents)
-        b_values = values[:-1].reshape(-1, args.num_agents)
+        b_global_obs = global_obs[:-1].transpose(0,1).reshape((-1,) + global_obs_space.shape)[:args.batch_size]
+        b_obs = obs[:-1].transpose(0,1).reshape((-1,args.num_agents) + partial_obs_space.shape)[:args.batch_size]
+        b_logprobs = logprobs[:-1].transpose(0,1).reshape(-1, args.num_agents)[:args.batch_size]
+        b_actions = actions[:-1].transpose(0,1).reshape((-1, args.num_agents) + action_space.shape)[:args.batch_size]
+        b_advantages = advantages[:-1].transpose(0,1).reshape(-1, args.num_agents)[:args.batch_size]
+        b_returns = returns[:-1].transpose(0,1).reshape(-1, args.num_agents)[:args.batch_size]
+        b_values = values[:-1].transpose(0,1).reshape(-1, args.num_agents)[:args.batch_size]
 
         # Optimizing the policy and value network
 
@@ -358,7 +407,8 @@ if __name__ == "__main__":
 
                     mb_advantages = b_advantages[mb_inds, idagent]
                     if args.norm_adv:
-                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                        # mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                        mb_advantages = (mb_advantages - b_advantages[:, idagent].mean()) / (b_advantages[:, idagent].std() + 1e-8)
 
                     # Policy loss
                     pg_loss1 = -mb_advantages * ratio
@@ -373,7 +423,7 @@ if __name__ == "__main__":
                     nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                     actor_optimizers[idagent].step()
 
-                    if (epoch == args.update_epochs-1) and (end >= args.batch_size-1):
+                    if (iteration % 5 == 0) and (epoch == args.update_epochs-1) and (end >= args.batch_size-1):
                         writer.add_scalar(f"charts/agent_{idagent}/learning_rate", actor_optimizers[idagent].param_groups[0]["lr"], global_step)
                         writer.add_scalar(f"losses/agent_{idagent}/policy_loss", pg_loss.item(), global_step)
                         writer.add_scalar(f"losses/agent_{idagent}/entropy", entropy_loss.item(), global_step)
@@ -409,19 +459,19 @@ if __name__ == "__main__":
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar(f"losses/value_loss", global_v_loss.item(), global_step)
-        writer.add_scalar(f"losses/explained_variance", explained_var, global_step)
+        
+        if iteration % 5 == 0:
+            writer.add_scalar(f"losses/value_loss", global_v_loss.item(), global_step)
+            writer.add_scalar(f"losses/explained_variance", explained_var, global_step)
     
-        if (iteration % 5 == 0) and args.save_model:
+        if (iteration % 100 == 0) and args.save_model:
             for idagent, agent in enumerate(agents):
                 torch.save(agent.state_dict(), model_path+f"_{idagent}")
             torch.save(shared_critic.state_dict(), model_path+f"_critic")
             print(f"model saved to {model_path}")
         
-        # print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+            # print("SPS:", int(global_step / (time.time() - start_time)))
+            writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         
     env.close()
     for idagent, agent in enumerate(agents):

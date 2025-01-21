@@ -21,13 +21,21 @@ from wfcrl.rewards import StepPercentage, RewardShaper
 from wfcrl import environments as envs
 
 from extractors import VectorExtractor
-from utils import LocalSummaryWriter, plot_env_history
-
+from utils import (
+    LocalSummaryWriter,
+    eval_wind_rose,
+    eval_policies, 
+    multidiscrete_one_hot, 
+    plot_env_history, 
+    prepare_eval_windrose, 
+)
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
+    scenario: str = "constant" # "windrose"
+    """the name of the scenario, identified by the wind series"""
     seed: int = 1
     """seed of the experiment"""
     torch_deterministic: bool = True
@@ -36,42 +44,42 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "Benchmark-WFCRL"
+    debug_log: bool = False
+    """if toggled, will log all power outputs and yaws step by step"""
+    wandb_project_name: str = "benchmark-wfcrl-v2"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
     save_model: bool = True
     """whether to save model into the `runs/{run_name}` folder"""
+    freq_eval: int = 50
+    """Number of iterations between eval"""
+    wind_data: str = "data/smarteole.csv"
+    """Path to wind data for wind rose evaluation"""
+    load_coef: float = 1
+    """coefficient of the load penalty"""
 
     # Algorithm specific arguments
     env_id: str = "Dec_Turb3_Row1_Floris"
     """the id of the environment"""
     total_timesteps: int = int(1e6)
     """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4 #3e-4 #7e-4 #
+    learning_rate: float = 5e-4 #3e-4 #7e-4 #
     """the learning rate of the optimizer"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    update_epochs: int = 10
-    """the K epochs to update the policy"""
-    clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
-    num_envs: int = 1
-    """the number of parallel game environments"""
 
     # QMIX arguments
-    episode_length: int = 2048
+    episode_length: int = 150
     """side of an trajectory to store in buffer size"""
 
     # DQN arguments
-    buffer_size: int = 500
+    buffer_size: int = 200
     """the replay memory buffer size in episode"""
     tau: float = 1.0
     """the target network update rate"""
-    target_network_frequency: int = 500
-    """the timesteps it takes to update the target network"""
+    target_network_frequency: int = 25
+    """the number of episodes it takes to update the target network"""
     batch_size: int = 32
     """the batch size (in episodes) of sample from the reply memory"""
     start_e: float = 1
@@ -80,23 +88,21 @@ class Args:
     """the ending epsilon for exploration"""
     exploration_fraction: float = 0.5
     """the fraction of `total-timesteps` it takes from start-e to go end-e"""
-    learning_starts: int = 500 #10000
+    learning_starts: int = 32
     """timestep to start learning"""
-    train_frequency: int = 10
-    """the frequency of training"""
     pretrained_models: str = None
     """Path to pretrained models"""
     hidden_layer_nn: Union[bool, tuple[int]] = (64,)
     """number of neurons in hidden layer"""
     debug: bool = False
     """debug mode saves monitoring logs during training"""
-    anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
 
     num_agents: int = 1
     """the number of agents in the environment"""
     reward_shaping: str = ""
     """Toggle learning rate annealing for policy and value networks"""
+    device: str = "cpu"
+    "device"
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -124,11 +130,6 @@ class QMixer(nn.Module):
             The final bias is produced by a 2 layer hypernetwork with a ReLU non-linearity."
         """
         self.observation_space = observation_space        
-        # self.network = nn.Sequential(
-        #     layer_init(nn.Linear(num_agents, hidden_dim), std=1.0),
-        #     nn.ELU(),
-        #     layer_init(nn.Linear(hidden_dim, 1), std=1.0),
-        # )
         self.hidden_dim = hidden_dim[0]
         self.num_agents = num_agents
 
@@ -178,7 +179,7 @@ class QMixer(nn.Module):
 class QNetwork(nn.Module):
     def __init__(self, observation_space, action_space, hidden_dims):
         super().__init__()
-        action_dim = action_space.n
+        action_dim = sum(action_space.nvec)
         self.observation_space = observation_space
         self.hidden_dim = hidden_dims[0]
         self.register_buffer(
@@ -189,7 +190,10 @@ class QNetwork(nn.Module):
         )
         self.l1 = layer_init(nn.Linear(np.prod(observation_space.shape) + action_dim, hidden_dims[0]), std=1.0)
         self.rnn = nn.GRUCell(self.hidden_dim, self.hidden_dim)
-        self.l2 = layer_init(nn.Linear(hidden_dims[-1], action_dim), std=1.0)
+        self.output_layers = nn.ModuleList([
+            nn.Linear(hidden_dims[-1], act_n)
+            for act_n in action_space.nvec
+        ])
         self.reset_hidden_state()
 
     def reset_hidden_state(self, batch_size=1):
@@ -200,7 +204,7 @@ class QNetwork(nn.Module):
         x = (x - self.input_low)/(self.input_high - self.input_low)
         x = F.relu(self.l1(x)).view(-1, self.hidden_dim)
         h = self.rnn(x, self.hidden_state.view(-1, self.hidden_dim))
-        q = self.l2(h)
+        q = torch.cat([net(h) for net in self.output_layers])
         self.hidden_state = h
         return q
 
@@ -211,15 +215,21 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    controls = ["yaw"]
+    controls = {"yaw": (-40, 40)}
+    assert args.scenario in ["constant", "windrose"]
     env = envs.make(
         args.env_id,
         controls=controls, 
         max_num_steps=args.episode_length,
+        continuous_control=False,
+        load_coef=args.load_coef 
     )
     args.num_agents = env.num_turbines
     args.reward_shaping = ""
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.scenario}_{args.seed}__{int(time.time())}"
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+
+    args.device = device
     if args.track:
         # os.environ["HTTPS_PROXY"] = "http://irsrvpxw1-std:8082"
         import wandb
@@ -245,16 +255,28 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     obs_space = env.observation_space(env.possible_agents[0])
     action_space_extractor = VectorExtractor(env.action_space(env.possible_agents[0]))
     partial_obs_extractor = VectorExtractor(obs_space)
     global_obs_extractor = VectorExtractor(env.state_space)
     partial_obs_space = partial_obs_extractor.space
     global_obs_space = global_obs_extractor.space
-    # action_space = action_space_extractor.space
-    action_space = gym.spaces.Discrete(3)
-    hidden_layer_nn = [] if not isinstance(args.hidden_layer_nn, tuple) else args.hidden_layer_nn
+    action_space = action_space_extractor.space
+    action_one_hot_dim = sum(action_space.nvec)
+
+    def get_deterministic_action(q_network, observation, last_action):
+        if last_action is None:
+            last_action = np.zeros(sum(action_space.nvec))
+        else:
+            last_action = multidiscrete_one_hot(action_space_extractor(last_action), action_space)
+        observation = partial_obs_extractor(observation)
+        input = torch.tensor(np.concatenate([observation, last_action]), dtype=torch.float32, device=device)
+        q_values = q_network(input)
+        action = torch.argmax(q_values, dim=-1).cpu().numpy()
+        return action_space_extractor.make_dict(np.array([action]))
+    
+    hidden_layer_nn = args.hidden_layer_nn if isinstance(args.hidden_layer_nn, tuple) else []
+
     q_networks = [
         QNetwork(partial_obs_space, action_space, hidden_layer_nn).to(device)
         for _ in range(args.num_agents)
@@ -271,15 +293,6 @@ if __name__ == "__main__":
         lr=args.learning_rate, eps=1e-5
     )
 
-    # ALGO Logic: Storage setup
-    buffer_global_obs = torch.zeros((args.buffer_size, args.episode_length) + global_obs_space.shape).to(device)
-    buffer_next_global_obs = torch.zeros((args.buffer_size, args.episode_length) + global_obs_space.shape).to(device)
-    buffer_obs = torch.zeros((args.buffer_size, args.episode_length, args.num_agents) + partial_obs_space.shape).to(device)
-    buffer_next_obs = torch.zeros((args.buffer_size, args.episode_length, args.num_agents) + partial_obs_space.shape).to(device)
-    buffer_actions = torch.zeros((args.buffer_size, args.episode_length, args.num_agents) + (action_space.n,)).to(device)
-    buffer_rewards = torch.zeros((args.buffer_size, args.episode_length, args.num_agents)).to(device)
-    buffer_dones = torch.zeros((args.buffer_size, args.episode_length, args.num_agents)).to(device)
-
     if args.pretrained_models is not None:
         args.pretrained_models = Path(args.pretrained_models)
         assert args.pretrained_models.exists()
@@ -293,33 +306,75 @@ if __name__ == "__main__":
     
     for q_network, target_q_network in zip(q_networks, target_q_networks):
         target_q_network.load_state_dict(q_network.state_dict())
+
+    windrose_eval = args.scenario == "windrose"
+    if windrose_eval:
+        windrose = prepare_eval_windrose(args.wind_data, num_bins=5)
+        def evaluate(eval_env, q_networks):
+            return eval_wind_rose(eval_env, q_networks, windrose, get_deterministic_action)[0]
+        env.reset(args.seed)
+    else:
+        def evaluate(eval_env, q_networks):
+            return eval_policies(eval_env, q_networks, get_deterministic_action)
+        env.reset(options={"wind_speed": 8, "wind_direction": 270})
+
+    # ALGO Logic: Storage setup
+    buffer_global_obs = torch.zeros((args.buffer_size, args.episode_length) + global_obs_space.shape).to(device)
+    buffer_obs = torch.zeros((args.buffer_size, args.episode_length, args.num_agents) + partial_obs_space.shape).to(device)
+    buffer_next_obs = torch.zeros((args.buffer_size, args.episode_length, args.num_agents) + partial_obs_space.shape).to(device)
+    buffer_actions = torch.zeros((args.buffer_size, args.episode_length, args.num_agents) + (action_one_hot_dim,)).to(device)
+    # actions = torch.zeros((args.buffer_size, args.num_agents) + action_space.shape, dtype=torch.int64, device=device)
+    buffer_rewards = torch.zeros((args.buffer_size, args.episode_length, args.num_agents)).to(device)
+    buffer_dones = torch.zeros((args.buffer_size, args.episode_length, args.num_agents)).to(device)
     
-    # TRY NOT TO MODIFY: start the game
     start_time = time.time()
-    env.reset(options={"wind_speed": 8, "wind_direction": 270}) 
     agents_list = env.possible_agents
     assert len(agents_list) == args.num_agents
-    cumul_rewards = 0
-    cumul_power = 0
+    cumul_rewards = cumul_power = cumul_load = 0
     episode_id = 0
+    last_done = False
     pt = 0
+    
 
     obs = np.zeros((args.num_agents,) + partial_obs_space.shape)
     next_obs = np.zeros((args.num_agents,) + partial_obs_space.shape)
-    actions = np.zeros((args.num_agents,) + (action_space.n,))
+    actions = np.zeros((args.num_agents,) + (action_one_hot_dim,))
     rewards = np.zeros((args.num_agents,))
     dones = np.zeros((args.num_agents,))
     
     for global_step in range(args.total_timesteps):
+        if last_done:
+            writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
+            writer.add_scalar(f"farm/episode_power", float(cumul_power) / args.episode_length, global_step)
+            writer.add_scalar(f"farm/episode_load", float(cumul_load) / args.episode_length, global_step)
+            writer.add_scalar(f"charts/epsilon", epsilon, global_step)
+            for q_network in q_networks:
+                q_network.reset_hidden_state()
+            if episode_id == 0 or (episode_id % args.freq_eval  == 0 and episode_id >= args.learning_starts):
+                print(f"Evaluating at iteration {episode_id}")
+                eval_score = evaluate(env, q_networks)
+                print("Episode:", episode_id, "Score: ", eval_score)
+                writer.add_scalar(f"eval/eval_score", eval_score, global_step)
+                for q_network in q_networks:
+                    q_network.reset_hidden_state()
+            cumul_rewards = cumul_power = cumul_load = 0
+            actions[:] = 0
+            pt = 0
+            episode_id += 1
+            if windrose_eval:
+                env.reset(args.seed+episode_id)
+            else:
+                env.reset(options={"wind_speed": 8, "wind_direction": 270})
 
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
 
         # ALGO LOGIC: action logic
         powers = []
+        loads = []
         with torch.no_grad():
             last_global_obs = env.state()
-            last_global_obs = torch.Tensor(global_obs_extractor(last_global_obs)).to(device)
+            last_global_obs = torch.tensor(global_obs_extractor(last_global_obs), dtype=torch.float32, device=device)
             for idagent, q_network in enumerate(q_networks):
                 last_obs, reward, terminations, truncations, infos = env.last()
                 last_obs = partial_obs_extractor(last_obs)
@@ -328,118 +383,116 @@ if __name__ == "__main__":
                     action = action_space.sample()
                     action = np.array(action)
                 else:
-                    input = torch.Tensor(np.concatenate([last_obs, actions[idagent]])).to(device)
+                    input = torch.tensor(np.concatenate([last_obs, actions[idagent]]), dtype=torch.float32, device=device)
                     q_values = q_network(input)
-                    action = torch.argmax(q_values, dim=-1).cpu().numpy()
+                    action = torch.argmax(q_values, dim=-1).cpu().numpy()[None]
                 
                 last_done = np.logical_or(terminations, truncations)
-                # last_done = torch.Tensor([last_done.astype(int)]).to(device)
 
+                one_hot_action = np.zeros(action_one_hot_dim)
+                ind = 0
+                for action_n, discrete_act in zip(action_space.nvec, action):
+                    one_hot_action[ind+discrete_act] = 1
+                    ind += action_n
                 # store values
-                # values[step, :, idagent] = value.flatten()
                 obs[idagent] = last_obs
                 dones[idagent] = last_done
                 rewards[idagent] = reward[0]
-                one_hot_action = torch.zeros(action_space.n).to(device)
-                one_hot_action[action] = 1
                 actions[idagent] = one_hot_action
 
                 if "power" in infos:
                     powers.append(infos["power"])
-                    writer.add_scalar(f"farm/power_T{idagent}", infos["power"], global_step)
                 if "load" in infos:
-                    writer.add_scalar(f"farm/load_T{idagent}", sum(np.abs(infos["load"])), global_step)
-                writer.add_scalar(f"farm/controls/yaw_T{idagent}", last_obs[0].item(), global_step)
+                    loads.append(float(np.mean(np.abs(infos["load"]))))
+                if args.debug_log:
+                    if "power" in infos:
+                        writer.add_scalar(f"farm/power_T{idagent}", infos["power"], global_step)
+                    if "load" in infos:
+                        writer.add_scalar(f"farm/load_T{idagent}", sum(np.abs(infos["load"])), global_step)
+                    writer.add_scalar(f"farm/controls/yaw_T{idagent}", last_obs[0].item(), global_step)
 
-                # store next action
-                #TODO: fix continuous_control=False to directly handle discretization
-                env.step(action_space_extractor.make_dict(action[None]-1))
+                if last_done:
+                    env.step(None)
+                else:
+                    env.step(action_space_extractor.make_dict(action))
+        
+        if args.debug_log:
             writer.add_scalar(f"farm/reward", float(reward[0]), global_step)
-
-        if "power" in infos:
-            writer.add_scalar(f"farm/power_total", sum(powers), global_step)
-            cumul_power += sum(powers)
+            if "power" in infos:
+                writer.add_scalar(f"farm/power_total", sum(powers), global_step)
+        cumul_power += sum(powers)
+        cumul_load += sum(loads)
         cumul_rewards += float(reward[0])
 
     
         # handle `final_observation`
-        for idagent, agent_name in enumerate(agents_list):
-            next_obs[idagent] = torch.Tensor(partial_obs_extractor(env.observe(agent_name))).to(device)
-        next_global_obs =  torch.Tensor(global_obs_extractor(env.state())).to(device)
+        # for idagent, agent_name in enumerate(agents_list):
+        #     next_obs[idagent] = torch.tensor(partial_obs_extractor(env.observe(agent_name)), dtype=torch.float32, device=device)
+        # next_global_obs =  torch.tensor(global_obs_extractor(env.state()), dtype=torch.float32, device=device)
         # FILL BUFFER
         buffer_id = episode_id % args.buffer_size
         buffer_global_obs[buffer_id, pt, :] = last_global_obs
-        buffer_next_global_obs[buffer_id, pt, :] = next_global_obs
-        buffer_obs[buffer_id, pt, :] = torch.Tensor(obs).to(device)
-        buffer_next_obs[buffer_id, pt, :] = torch.Tensor(next_obs).to(device)
-        buffer_actions[buffer_id, pt, :] = torch.Tensor(actions).to(device) 
-        buffer_rewards[buffer_id, pt, :] = torch.Tensor(rewards).to(device)
-        buffer_dones[buffer_id, pt, :] = torch.Tensor(dones).to(device)
+        buffer_obs[buffer_id, pt, :] = torch.tensor(obs, dtype=torch.float32, device=device)
+        buffer_actions[buffer_id, pt, :] = torch.tensor(actions, dtype=torch.float32, device=device) 
+        buffer_rewards[buffer_id, pt, :] = torch.tensor(rewards, dtype=torch.float32, device=device)
+        buffer_dones[buffer_id, pt, :] = torch.tensor(dones, dtype=torch.float32, device=device)
         pt += 1
 
-        # ALGO LOGIC: training.
-        if any(dones):
-            assert all(dones)
-            writer.add_scalar(f"farm/episode_reward", float(cumul_rewards), global_step)
-            writer.add_scalar(f"farm/episode_power", float(cumul_power) / args.train_frequency, global_step)
-            cumul_rewards = 0
-            cumul_power = 0
-            env.reset(options={"wind_speed": 8, "wind_direction": 270})
-            episode_id += 1
-            pt = 0
+        if (episode_id > args.learning_starts) and last_done:
+            rewards_mean = buffer_rewards[:min(episode_id, args.buffer_size), :, 0].flatten().mean()
+            rewards_std = buffer_rewards[:min(episode_id, args.buffer_size), :, 0].flatten().std()
 
-            if global_step > args.learning_starts:
-
-                # Optimizing the value network
-                b_inds = np.random.choice(np.arange(min(episode_id, args.buffer_size)), args.batch_size)
-                qval_preds = []
-                targets = []
-                for idagent, (q_network, target_network) in enumerate(zip(q_networks, target_q_networks)):
-                    trajectory_targets = []
-                    trajectory_qval_preds = []
-                    target_network.reset_hidden_state(args.batch_size)
-                    q_network.reset_hidden_state(args.batch_size)
-                    
-                    for t in range(1, args.episode_length):
-                        with torch.no_grad():
-                            input = torch.cat([buffer_next_obs[b_inds, t, idagent], buffer_actions[b_inds, t, idagent]], 1)
-                            target_max, _ = target_q_networks[idagent](input).max(dim=1)
-                            # v_next_max = args.gamma * target_max * (1 - buffer_dones[b_inds, t, idagent].flatten())
-                            # td_target = buffer_rewards[b_inds, t, idagent].flatten() + v_next_max
-                            trajectory_targets.append(target_max)
-
-                        input = torch.cat([buffer_obs[b_inds, t, idagent], buffer_actions[b_inds, t-1, idagent]], 1)
-                        action_indices = torch.where(buffer_actions[b_inds, t, idagent])[1]
-                        old_val = q_network(input).gather(1, action_indices[None]).squeeze()
-                        trajectory_qval_preds.append(old_val)
-                    
-                    targets.append(torch.stack(trajectory_targets, dim=1))
-                    qval_preds.append(torch.stack(trajectory_qval_preds, dim=1))
+            # Optimizing the value network
+            b_inds = np.random.choice(np.arange(min(episode_id, args.buffer_size)), args.batch_size)
+            qval_preds = []
+            targets = []
+            for idagent, (q_network, target_network) in enumerate(zip(q_networks, target_q_networks)):
+                trajectory_targets = []
+                trajectory_qval_preds = []
+                target_network.reset_hidden_state(args.batch_size)
+                q_network.reset_hidden_state(args.batch_size)
                 
-                qval_preds = torch.stack(qval_preds, dim=-1).view(-1,action_space.n)
-                targets = torch.stack(targets, dim=-1).view(-1,action_space.n)
-                
-                with torch.no_grad():
-                    b_global_obs = buffer_next_global_obs[b_inds, 1:, :].view((-1,)+global_obs_space.shape)
-                    target_max_qmix = target_qmixer(targets, b_global_obs)
-                    v_next_max_qmix = args.gamma * target_max_qmix.flatten() * (1 - buffer_dones[b_inds, 1:, 0].flatten())
-                    td_target = buffer_rewards[b_inds, 1:, 0].flatten() + v_next_max_qmix
-                qmixer_old_val = qmixer(qval_preds, buffer_global_obs[b_inds, 1:, :].view((-1,)+global_obs_space.shape))
-                
-                loss = F.mse_loss(td_target, qmixer_old_val.squeeze())
+                for t in range(1, args.episode_length-1):
+                    with torch.no_grad():
+                        input = torch.cat([buffer_obs[b_inds, t+1, idagent], buffer_actions[b_inds, t, idagent]], 1)
+                        target_max, _ = target_q_networks[idagent](input).max(dim=1)
+                        # v_next_max = args.gamma * target_max * (1 - buffer_dones[b_inds, t, idagent].flatten())
+                        # td_target = buffer_rewards[b_inds, t, idagent].flatten() + v_next_max
+                        trajectory_targets.append(target_max)
 
-                if global_step % 100 == 0:
-                    writer.add_scalar(f"losses/agent_{idagent}/td_loss", loss, global_step)
-                    writer.add_scalar(f"losses/agent_{idagent}/q_values", qmixer_old_val.mean().item(), global_step)
-                    # print("SPS:", int(global_step / (time.time() - start_time)))
+                    input = torch.cat([buffer_obs[b_inds, t, idagent], buffer_actions[b_inds, t-1, idagent]], 1)
+                    #TODO: adapt to multidiscrete
+                    action_indices = buffer_actions[b_inds, t, idagent].max(dim=-1)[1][:,None]
+                    old_val = q_network(input).gather(1, action_indices).squeeze()
+                    trajectory_qval_preds.append(old_val)
 
-                # optimize the model
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                targets.append(torch.stack(trajectory_targets, dim=1))
+                qval_preds.append(torch.stack(trajectory_qval_preds, dim=1))
+            
+            qval_preds = torch.stack(qval_preds, dim=-1).view(-1,args.num_agents)
+            targets = torch.stack(targets, dim=-1).view(-1,args.num_agents)
+            
+            with torch.no_grad():
+                b_next_global_obs = buffer_global_obs[b_inds, 2:, :].view((-1,)+global_obs_space.shape)
+                target_max_qmix = target_qmixer(targets, b_next_global_obs)
+                v_next_max_qmix = args.gamma * target_max_qmix.flatten() * (1 - buffer_dones[b_inds, 2:, 0].flatten())
+                standard_rewards = (buffer_rewards[b_inds, 2:, 0] - rewards_mean) / rewards_std
+                td_target = standard_rewards.flatten() + v_next_max_qmix
+            qmixer_old_val = qmixer(qval_preds, buffer_global_obs[b_inds, 1:-1, :].view((-1,)+global_obs_space.shape))
 
-                    # update target network
-            if global_step % args.target_network_frequency == 0:
+            loss = F.mse_loss(td_target, qmixer_old_val.squeeze())
+
+            if episode_id % 5 == 0:
+                writer.add_scalar(f"losses/agent_{idagent}/td_loss", loss, global_step)
+                writer.add_scalar(f"losses/agent_{idagent}/q_values", qmixer_old_val.mean().item(), global_step)
+
+            # optimize the model
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+                # update target network
+            if episode_id % args.target_network_frequency == 0:
                 for q_network, target_network in zip(q_networks, target_q_networks):
                     for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
                         target_network_param.data.copy_(
@@ -449,29 +502,28 @@ if __name__ == "__main__":
                         target_network_param.data.copy_(
                             args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                         )
-        
+    
             for q_network in q_networks:
                 q_network.reset_hidden_state()
             for target_network in target_q_networks:
                 target_network.reset_hidden_state()
-        
-        if (global_step % 10000 == 0) and args.save_model:
-            for idagent, q_network in enumerate(q_networks):
-                torch.save(q_network.state_dict(), model_path+f"_{idagent}")
-            # torch.save(shared_critic.state_dict(), model_path+f"_critic")
-            print(f"model saved to {model_path}")
-        
-            print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-    
-env.close()
-for idagent, q_network in enumerate(q_networks):
-    torch.save(q_network.state_dict(), model_path+f"_{idagent}")
-# torch.save(shared_critic.state_dict(), model_path+f"_critic")
-print(f"model saved to {model_path}")
-writer.close()
+
+            if episode_id % 100 == 0 and args.save_model:
+                for idagent, q_network in enumerate(q_networks):
+                    torch.save(q_network.state_dict(), model_path+f"_{idagent}")
+                # torch.save(shared_critic.state_dict(), model_path+f"_critic")
+                print(f"model saved to {model_path}")
+                print("SPS:", int(global_step / (time.time() - start_time)))
+                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    env.close()
+    for idagent, q_network in enumerate(q_networks):
+        torch.save(q_network.state_dict(), model_path+f"_{idagent}")
+    # torch.save(shared_critic.state_dict(), model_path+f"_critic")
+    print(f"model saved to {model_path}")
+    writer.close()
 
 
-# Prepare plots
-fig = plot_env_history(env)
-fig.savefig(f"runs/{run_name}/plot.png")
+    # Prepare plots
+    fig = plot_env_history(env)
+    fig.savefig(f"runs/{run_name}/plot.png")

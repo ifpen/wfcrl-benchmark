@@ -16,7 +16,7 @@
 
 module purge
 module load cuda/11.4.0
-module load gnu8 openmpi3
+module load gnu13 openmpi4
 
 echo "Running job on a single cpu"
 
@@ -24,4 +24,5 @@ echo "Running job on a single cpu"
 source /home/$USER/.bashrc
 conda activate wfcrl_algos
 
-python algos/baseline_ippo_windrose.py --seed ${SLURM_ARRAY_TASK_ID} --env_id Dec_Turb3_Row1_Floris --total_timesteps 50000 --freq_eval 5
+python algos/baseline_ippo.py --seed ${SLURM_ARRAY_TASK_ID} --env_id Dec_Turb3_Row1_Floris --total_timesteps 200000
+python algos/baseline_ippo.py --seed ${SLURM_ARRAY_TASK_ID} --env_id Dec_Turb3_Row1_Floris --total_timesteps 200000 --scenario windrose

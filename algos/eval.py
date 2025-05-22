@@ -176,7 +176,8 @@ if __name__ == "__main__":
     for iteration in range(1, args.num_episodes + 1):
         if args.scenario == "windrose":
             score, windrose_r, bins = eval_wind_rose(env, agents, windrose, get_deterministic_action)
-            pd.DataFrame(np.c_[bins, windrose_r]).to_csv(args.pretrained_models/f"{args.output_folder}/windrose_scores.csv", index=False)
+            df = pd.DataFrame(np.c_[bins, windrose_r], columns=["wd", "ws", "score"])
+            df.to_csv(args.pretrained_models/f"{args.output_folder}/windrose_scores.csv", index=False)
         else:
             score = eval_policies(env, agents, get_deterministic_action)
             yaws, powers, loads, rewards = get_env_history(env)

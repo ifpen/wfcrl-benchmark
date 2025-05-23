@@ -23,13 +23,13 @@ pip install -r requirements
 Launch an IPPO training experiment on the `Dec_Ablaincourt_Floris` environment:
 
 ```
-python algos/baseline_ippo.py --seed 1 --env_id Dec_Ablaincourt_Floris --total_timesteps 1000000
+python algos/baseline_ippo.py --seed 1 --env_id Dec_Ablaincourt_Floris --total_timesteps 100000
 ```
 
 Evaluate it on the on the `Dec_Ablaincourt_Fastfarm` environment:
 
 ```
-mpiexec -n 1 python algos/eval.py --seed 0 --env_id Dec_Ablaincourt_Fastfarm --total_timesteps 10000 --pretrained_models path/to/run
+mpiexec -n 1 python algos/eval.py --seed 0 --algo ippo --env_id Dec_Ablaincourt_Fastfarm --num_episodes 1 --pretrained_models path/to/run
 ```
 
 Experiments for training and evaluation runs are in the `scripts` folder. Add `--scenario windrose` to train/eval on *Wind Scenario II*:

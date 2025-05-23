@@ -122,6 +122,7 @@ def eval_wind_rose(env, policies, wind_rose, get_action=None):
     wd_values = (wd_bins[:-1] + wd_bins[1:])/2
     ws_values = (ws_bins[:-1] + ws_bins[1:])/2
     num_episodes = freq.size
+    bins = []
     print(f"Evaluating on {num_episodes} episodes")
     episode_rewards = []
     score = 0
@@ -134,7 +135,8 @@ def eval_wind_rose(env, policies, wind_rose, get_action=None):
             r = float(list(r.values())[0]) #r = float(r[env.possible_agents[0]])
             episode_rewards.append(r)
             score += freq[i, j] * r
-    return score, np.array(episode_rewards)
+            bins.append((wd,ws))
+    return score, np.array(episode_rewards), bins
 
 def multidiscrete_one_hot(action, action_space):
     one_hot_action = np.zeros(sum(action_space.nvec))

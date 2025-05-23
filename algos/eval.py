@@ -89,6 +89,8 @@ class Args:
     """the id of the environment"""
     num_episodes: int = 1
     """the number of iterations (computed in runtime)"""
+    algo: str = "ippo"
+    """ the name of the trained algorithm"""
 
     # model arguments
     pretrained_models: str = "path/to/model" # 
@@ -107,9 +109,8 @@ class Args:
 if __name__ == "__main__":
     args = tyro.cli(Args)
     controls = ["yaw"]
-    env_id, task, algo, _ = args.pretrained_models.split("/")[1:]
-    # check that models were trained for the same wind farm
-    assert env_id[:-7] == "_".join(args.env_id.split("_")[1:-1])
+    algo = args.algo
+    assert algo in ["ippo", "mappo", "idqn", "idrqn", "qmix"]
     env = envs.make(
         args.env_id,
         controls=controls, 
@@ -175,7 +176,8 @@ if __name__ == "__main__":
     for iteration in range(1, args.num_episodes + 1):
         if args.scenario == "windrose":
             score, windrose_r, bins = eval_wind_rose(env, agents, windrose, get_deterministic_action)
-            pd.DataFrame(np.c_[bins, windrose_r]).to_csv(args.pretrained_models/f"{args.output_folder}/windrose_scores.csv", index=False)
+            df = pd.DataFrame(np.c_[bins, windrose_r], columns=["wd", "ws", "score"])
+            df.to_csv(args.pretrained_models/f"{args.output_folder}/windrose_scores.csv", index=False)
         else:
             score = eval_policies(env, agents, get_deterministic_action)
             yaws, powers, loads, rewards = get_env_history(env)
